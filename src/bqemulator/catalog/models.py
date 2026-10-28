@@ -60,16 +60,15 @@ class TableFieldSchema(_Frozen):
     def data_type(self) -> str:
         """Render this column's GoogleSQL ``data_type`` string.
 
-        Matches the form BigQuery documents for
-        ``INFORMATION_SCHEMA.COLUMNS.data_type``:
-
-        * scalars: the canonical type name (``INT64``, ``STRING``,
-          ``TIMESTAMP``); legacy wire-format spellings (``INTEGER`` /
-          ``FLOAT`` / ``BOOLEAN`` / ``RECORD``) are normalised.
-        * ``ARRAY<T>`` for repeated fields.
-        * ``STRUCT<field1 T1, field2 T2>`` for nested records.
-        * ``RANGE<T>`` for RANGE columns (with the inner element type).
-        * NUMERIC / BIGNUMERIC carry their precision/scale when set.
+        The form matches what BigQuery documents for
+        ``INFORMATION_SCHEMA.COLUMNS.data_type``. Scalars render as the
+        canonical type name (``INT64``, ``STRING``, ``TIMESTAMP``), with
+        the legacy wire-format spellings ``INTEGER``, ``FLOAT``,
+        ``BOOLEAN`` and ``RECORD`` normalised. Repeated fields render as
+        ``ARRAY<T>``, nested records as ``STRUCT<field1 T1, field2 T2>``
+        and RANGE columns as ``RANGE<T>`` with their element type.
+        ``NUMERIC`` and ``BIGNUMERIC`` carry their precision and scale
+        when set.
         """
         inner = self._inner_data_type()
         if self.mode == "REPEATED":
