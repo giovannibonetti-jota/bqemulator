@@ -57,6 +57,52 @@ class TableFieldSchema(_Frozen):
     # REST ``rangeElementType`` shape.
     range_element_type: TableFieldSchema | None = None
 
+    def data_type(self) -> str:
+        """Render this column's GoogleSQL ``data_type`` string.
+
+        Matches the form BigQuery documents for
+        ``INFORMATION_SCHEMA.COLUMNS.data_type``:
+
+        * scalars: the canonical type name (``INT64``, ``STRING``,
+          ``TIMESTAMP``); legacy wire-format spellings (``INTEGER`` /
+          ``FLOAT`` / ``BOOLEAN`` / ``RECORD``) are normalised.
+        * ``ARRAY<T>`` for repeated fields.
+        * ``STRUCT<field1 T1, field2 T2>`` for nested records.
+        * ``RANGE<T>`` for RANGE columns (with the inner element type).
+        * NUMERIC / BIGNUMERIC carry their precision/scale when set.
+        """
+        inner = self._inner_data_type()
+        if self.mode == "REPEATED":
+            return f"ARRAY<{inner}>"
+        return inner
+
+    def _inner_data_type(self) -> str:
+        bq_type = self.type.upper()
+        bq_type = _LEGACY_TYPE_ALIASES.get(bq_type, bq_type)
+        if bq_type == "STRUCT":
+            nested = ", ".join(
+                f"{nested_field.name} {nested_field.data_type()}" for nested_field in self.fields
+            )
+            return f"STRUCT<{nested}>"
+        if bq_type == "RANGE" and self.range_element_type is not None:
+            return f"RANGE<{self.range_element_type.data_type()}>"
+        if bq_type in {"NUMERIC", "BIGNUMERIC"} and self.precision is not None:
+            if self.scale is not None:
+                return f"{bq_type}({self.precision}, {self.scale})"
+            return f"{bq_type}({self.precision})"
+        return bq_type
+
+
+#: Legacy BigQuery type names → GoogleSQL canonical names. Real BigQuery
+#: accepts the legacy spellings on input but always renders the
+#: canonical form in ``INFORMATION_SCHEMA.COLUMNS.data_type``.
+_LEGACY_TYPE_ALIASES: dict[str, str] = {
+    "INTEGER": "INT64",
+    "FLOAT": "FLOAT64",
+    "BOOLEAN": "BOOL",
+    "RECORD": "STRUCT",
+}
+
 
 TableFieldSchema.model_rebuild()
 
