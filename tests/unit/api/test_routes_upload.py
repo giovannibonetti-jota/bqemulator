@@ -203,6 +203,38 @@ class TestMultipartUpload:
         )
         assert r.status_code == 200
 
+    def test_ndjson_multipart_with_wildcard_content_type_loads_table(self, app: FastAPI) -> None:
+        """``google-cloud-bigquery``'s multipart path never sets the media
+        part's Content-Type explicitly; ``requests``' MIME encoder
+        defaults it to ``*/*``. That's the form every unmodified client
+        actually sends for a small (sub-resumable-threshold) NDJSON load
+        — ``test_ndjson_multipart_loads_table`` above pins an explicit
+        ``application/json`` that the wire never carries.
+        """
+        c = TestClient(app)
+        envelope = {
+            "configuration": {
+                "load": {
+                    "destinationTable": {"projectId": "p", "datasetId": "d", "tableId": "t"},
+                    "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                    "writeDisposition": "WRITE_TRUNCATE",
+                }
+            }
+        }
+        ndjson = b'{"id":1,"name":"a"}\n{"id":2,"name":"b"}\n'
+        ct, body = _build_multipart_related(envelope, ndjson, media_ct="*/*")
+        r = c.post(
+            "/upload/bigquery/v2/projects/p/jobs?uploadType=multipart",
+            headers={"Content-Type": ct},
+            content=body,
+        )
+        assert r.status_code == 200, r.text
+        query = TestClient(app).post(
+            "/bigquery/v2/projects/p/queries",
+            json={"query": "SELECT COUNT(*) AS n FROM `p.d.t`", "useLegacySql": False},
+        )
+        assert query.json()["rows"][0]["f"][0]["v"] == "2"
+
     def test_multipart_with_wrong_content_type_returns_400(self, app: FastAPI) -> None:
         c = TestClient(app, raise_server_exceptions=False)
         r = c.post(

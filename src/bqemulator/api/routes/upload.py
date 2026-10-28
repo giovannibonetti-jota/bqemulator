@@ -77,7 +77,25 @@ _HTTP_RESUME_INCOMPLETE = 308
 #: upload and the body of a media/resumable upload. The whitelist
 #: matches BigQuery's documented load-source formats (CSV / NDJSON /
 #: Parquet / Avro / ORC) plus the canonical generic forms BQ accepts.
+#:
+#: ``*/*`` is included even though it names no actual format: the
+#: real BigQuery service tolerates it and every Google Cloud client
+#: library relies on that tolerance. ``google-cloud-bigquery``'s
+#: ``Client.load_table_from_json``/``load_table_from_file`` — the
+#: multipart path taken for any payload under ~5 MiB — never sets an
+#: explicit media part Content-Type, so ``requests``' MIME encoder
+#: defaults it to ``*/*``. This is safe to permit here for the same
+#: reason it's safe on the real service: this whitelist gates the
+#: *declared* media Content-Type header only, never the actual parse
+#: dispatch — ``_load_path_into_target`` always dispatches on the job
+#: config's ``configuration.load.sourceFormat`` (validated separately,
+#: with its own restricted set of accepted values), never on this
+#: header. Rejecting ``*/*`` here doesn't add any security value one
+#: of the real formats above wouldn't already provide — it only broke
+#: every small (sub-resumable-threshold) NDJSON/CSV-autodetect load
+#: sent by an unmodified official client library.
 _PERMITTED_MEDIA_CONTENT_TYPES = (
+    "*/*",
     "application/octet-stream",
     "application/x-www-form-urlencoded",
     "application/json",
