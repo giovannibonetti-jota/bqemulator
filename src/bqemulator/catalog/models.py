@@ -77,6 +77,7 @@ class TableFieldSchema(_Frozen):
         return inner
 
     def _inner_data_type(self) -> str:
+        """Render the element type; ``data_type`` wraps it in ``ARRAY<…>`` for REPEATED."""
         bq_type = self.type.upper()
         bq_type = _LEGACY_TYPE_ALIASES.get(bq_type, bq_type)
         if bq_type == "STRUCT":

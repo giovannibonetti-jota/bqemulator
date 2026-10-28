@@ -1,13 +1,13 @@
-"""Regression: a view that filters a STRUCT column read through ``SELECT *``.
+"""A function over a view that filters a STRUCT column read through ``SELECT *``.
 
-The translator's ``annotate_types`` pass expands ``SELECT *`` from a
-catalog schema snapshot. A DDL-created ``STRUCT`` column lands in the
-catalog as ``RECORD`` with nested ``fields``; the snapshot used to drop
-it as unmappable, so the star expanded without it and the view's outer
-``WHERE meta.change_type …`` could no longer bind once any translation
-rule forced the qualified tree to be serialised (``UPPER``, ``CONCAT``,
-``||`` …). A plain ``SELECT col`` through the same view worked, which
-made the failure look like a function bug rather than a schema one.
+The translator expands ``SELECT *`` from the catalog schema snapshot
+before ``annotate_types`` runs, so the snapshot carries every column of
+the base table, including the ``STRUCT`` / ``ARRAY`` ones DDL stores as
+``RECORD`` / ``REPEATED``. The view's outer ``WHERE meta.change_type …``
+binds only while the expanded inner star still carries ``meta``, and the
+projection function (``UPPER``, ``CONCAT``, ``||``) is what makes the
+translator serialise the qualified tree rather than the original SQL,
+so the three projections cover the path a plain ``SELECT col`` skips.
 
 This is the shape every CDC dedup view takes (Datastream, Debezium):
 ``SELECT * EXCEPT (meta) FROM (SELECT * FROM raw QUALIFY ROW_NUMBER()
@@ -31,6 +31,7 @@ pytestmark = pytest.mark.integration
 
 @pytest_asyncio.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
+    """In-process ephemeral emulator with dataset ``p.ds`` created."""
     settings = Settings(persistence_mode=PersistenceMode.EPHEMERAL, rest_port=0, grpc_port=0)
     s = EmulatorServer(settings)
     await s.start()
@@ -47,6 +48,7 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
 
 
 async def _run(client: httpx.AsyncClient, sql: str) -> dict[str, Any]:
+    """Run *sql* through ``jobs.query`` and return the response payload."""
     r = await client.post(
         "/bigquery/v2/projects/p/queries",
         json={"query": sql, "useLegacySql": False},
@@ -56,6 +58,7 @@ async def _run(client: httpx.AsyncClient, sql: str) -> dict[str, Any]:
 
 
 def _rows(payload: dict[str, Any]) -> list[list[str]]:
+    """Flatten a ``jobs.query`` response into ``[[cell, …], …]``."""
     return [[c["v"] for c in row["f"]] for row in payload.get("rows", [])]
 
 
@@ -71,6 +74,7 @@ async def test_function_over_dedup_view_binds_struct_filter(
     client: httpx.AsyncClient,
     projection: str,
 ) -> None:
+    """The STRUCT filter binds and the projected rows match for each function."""
     await _run(
         client,
         "CREATE TABLE ds.raw (id INT64, name STRING, "
@@ -97,4 +101,5 @@ async def test_function_over_dedup_view_binds_struct_filter(
     assert _rows(plain) == [["b"]]
 
     rewritten = await _run(client, f"SELECT {projection} AS n FROM ds.dedup ORDER BY id")
-    assert _rows(rewritten) == [["B"]] if projection.startswith("UPPER") else [["b!"]]
+    expected = [["B"]] if projection.startswith("UPPER") else [["b!"]]
+    assert _rows(rewritten) == expected
