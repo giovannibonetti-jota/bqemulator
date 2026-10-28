@@ -477,19 +477,19 @@ class SQLTranslator:
                 continue
             new_expressions = []
             for item in group.expressions:
-                key = None
+                item_key: str | None = None
                 if (
                     isinstance(item, exp.Column)
                     and not item.table
                     and isinstance(item.this, exp.Identifier)
                 ):
-                    key = _identifier_key(item.this)
-                if key is not None and key in ambiguous_keys:
+                    item_key = _identifier_key(item.this)
+                if item_key is not None and item_key in ambiguous_keys:
                     raise InvalidQueryError(
                         f"Column name {item.name} is ambiguous",
                         location="query",
                     )
-                position = alias_positions.get(key) if key is not None else None
+                position = alias_positions.get(item_key) if item_key is not None else None
                 if position is None:
                     new_expressions.append(item)
                 else:
