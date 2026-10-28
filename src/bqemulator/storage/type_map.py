@@ -260,6 +260,13 @@ def bq_schema_to_duckdb_columns(
                     f"RANGE field {name!r} rangeElementType missing 'type'",
                 )
             duckdb_type = bq_to_duckdb(f"RANGE<{elem_type}>")
+        elif "(" in bq_type:
+            # REST schemas carry precision / scale / maxLength as separate
+            # fields; BigQuery rejects a parameterized ``type`` string.
+            raise ValidationError(
+                f"Field {name!r}: type {bq_type!r} must not carry parameters; "
+                "use the precision, scale or maxLength fields",
+            )
         else:
             duckdb_type = bq_to_duckdb(bq_type)
 

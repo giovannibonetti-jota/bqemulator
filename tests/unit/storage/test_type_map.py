@@ -223,6 +223,12 @@ class TestBqSchemaToDuckdbColumns:
             ("created", "TIMESTAMPTZ"),
         ]
 
+    def test_parameterized_type_string_rejected(self) -> None:
+        # BigQuery's REST schema takes precision / scale / maxLength as
+        # separate fields and rejects ``"type": "NUMERIC(10, 2)"``.
+        with pytest.raises(ValidationError, match="must not carry parameters"):
+            bq_schema_to_duckdb_columns([{"name": "x", "type": "NUMERIC(10, 2)"}])
+
     def test_repeated_mode_wraps_in_list(self) -> None:
         fields = [{"name": "tags", "type": "STRING", "mode": "REPEATED"}]
         cols = bq_schema_to_duckdb_columns(fields)
