@@ -137,7 +137,7 @@ class TestTranslatorIsStateless:
 
 
 class TestAnnotateTreeIsolation:
-    """``_annotate_tree`` must never leak a half-qualified tree."""
+    """Verify ``_annotate_tree`` never leaks a half-qualified tree."""
 
     def test_failed_qualify_leaves_translation_untouched(self) -> None:
         # The schema omits ``meta`` so SQLGlot's ``qualify`` raises

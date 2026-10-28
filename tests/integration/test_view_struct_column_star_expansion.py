@@ -1,4 +1,4 @@
-"""A function over a view that filters a STRUCT column read through ``SELECT *``.
+"""Verify that functions over a view filtering a STRUCT column bind through ``SELECT *``.
 
 The translator expands ``SELECT *`` from the catalog schema snapshot
 before ``annotate_types`` runs, so the snapshot carries every column of
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.integration
 
 @pytest_asyncio.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
-    """In-process ephemeral emulator with dataset ``p.ds`` created."""
+    """Start an in-process ephemeral emulator and create dataset ``p.ds``."""
     settings = Settings(persistence_mode=PersistenceMode.EPHEMERAL, rest_port=0, grpc_port=0)
     s = EmulatorServer(settings)
     await s.start()
@@ -74,7 +74,7 @@ async def test_function_over_dedup_view_binds_struct_filter(
     client: httpx.AsyncClient,
     projection: str,
 ) -> None:
-    """The STRUCT filter binds and the projected rows match for each function."""
+    """Check that the STRUCT filter binds and the projected rows match for each function."""
     await _run(
         client,
         "CREATE TABLE ds.raw (id INT64, name STRING, "
