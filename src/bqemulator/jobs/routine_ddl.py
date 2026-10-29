@@ -81,16 +81,19 @@ def resolve_create_routine_operation(script: Any, project_id: str, ctx: AppConte
 
     Must run **before** the interpreter registers the routine: ``REPLACE``
     is reported only when ``OR REPLACE`` targets a routine that already
-    exists in the catalog; otherwise ``CREATE``. Returns ``""`` when the
-    script is not a single CREATE FUNCTION / TVF (e.g. a procedure, whose
-    operation field is absent).
+    exists in the catalog, ``SKIP`` when ``IF NOT EXISTS`` does; otherwise
+    ``CREATE``. Returns ``""`` when the script is not a single CREATE
+    FUNCTION / TVF (e.g. a procedure, whose operation field is absent).
     """
     stmt = _single_statement(script)
     if not isinstance(stmt, CreateFunctionStmt):
         return ""
     ref = _resolve_routine_ref(stmt.name, project_id)
-    if ref is not None and stmt.or_replace and ctx.catalog.get_routine(*ref) is not None:
+    exists = ref is not None and ctx.catalog.get_routine(*ref) is not None
+    if exists and stmt.or_replace:
         return "REPLACE"
+    if exists and stmt.if_not_exists:
+        return "SKIP"
     return "CREATE"
 
 

@@ -460,3 +460,44 @@ class TestPassthroughSql:
     def test_multiple_statements(self) -> None:
         script = parse_script("SELECT 1; SELECT 2; SELECT 3;")
         assert len(script.statements) == 3
+
+
+class TestCreateRoutineIfNotExists:
+    def test_function_if_not_exists(self) -> None:
+        script = parse_script(
+            "CREATE FUNCTION IF NOT EXISTS ds.f(id INT64) RETURNS TIMESTAMP "
+            "AS (TIMESTAMP_MICROS(id >> 11))"
+        )
+        stmt = script.statements[0]
+        assert isinstance(stmt, CreateFunctionStmt)
+        assert stmt.if_not_exists is True
+        assert stmt.or_replace is False
+        assert stmt.body == "TIMESTAMP_MICROS(id >> 11)"
+
+    def test_procedure_if_not_exists(self) -> None:
+        stmt = parse_script("CREATE PROCEDURE IF NOT EXISTS ds.p() BEGIN SELECT 1; END").statements[
+            0
+        ]
+        assert isinstance(stmt, CreateProcedureStmt)
+        assert stmt.if_not_exists is True
+
+    def test_or_replace_and_if_not_exists_conflict(self) -> None:
+        with pytest.raises(InvalidQueryError, match="OR REPLACE and IF NOT EXISTS"):
+            parse_script("CREATE OR REPLACE FUNCTION IF NOT EXISTS ds.f() AS (1)")
+
+    def test_raw_triple_quoted_js_body_keeps_backslashes(self) -> None:
+        """``AS r\"\"\"...\"\"\"`` is how multi-line JS bodies with regexes are written."""
+        stmt = parse_script(
+            "CREATE FUNCTION IF NOT EXISTS ds.f(a STRING) RETURNS STRING LANGUAGE js\n"
+            'AS\nr"""\n  return /\\d+/.test(a) ? `${a}` : a;\n"""'
+        ).statements[0]
+        assert isinstance(stmt, CreateFunctionStmt)
+        assert stmt.language == "JAVASCRIPT"
+        assert stmt.body == "\n  return /\\d+/.test(a) ? `${a}` : a;\n"
+
+    def test_plain_js_body_still_decodes_escapes(self) -> None:
+        body = '"return /\\\\d+/.test(a);"'
+        sql = f"CREATE TEMP FUNCTION f(a STRING) RETURNS BOOL LANGUAGE js AS {body}"
+        stmt = parse_script(sql).statements[0]
+        assert isinstance(stmt, CreateFunctionStmt)
+        assert stmt.body == "return /\\d+/.test(a);"

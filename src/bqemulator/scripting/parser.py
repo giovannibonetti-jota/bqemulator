@@ -528,15 +528,39 @@ class Parser:
 
         if self._cursor.match_keyword("FUNCTION"):
             self._cursor.advance()
-            return self._parse_function_rest(or_replace=or_replace, table_fn=is_table_fn)
+            if_not_exists = self._consume_if_not_exists(or_replace=or_replace)
+            return self._parse_function_rest(
+                or_replace=or_replace, table_fn=is_table_fn, if_not_exists=if_not_exists
+            )
         if self._cursor.match_keyword("PROCEDURE"):
             self._cursor.advance()
-            return self._parse_procedure_rest(or_replace=or_replace)
+            if_not_exists = self._consume_if_not_exists(or_replace=or_replace)
+            return self._parse_procedure_rest(or_replace=or_replace, if_not_exists=if_not_exists)
         raise InvalidQueryError(
             f"CREATE {'TEMP ' if is_temp else ''}... expected FUNCTION or PROCEDURE",
         )
 
-    def _parse_function_rest(self, *, or_replace: bool, table_fn: bool) -> CreateFunctionStmt:
+    def _consume_if_not_exists(self, *, or_replace: bool) -> bool:
+        """Consume an optional ``IF NOT EXISTS`` after the routine keyword.
+
+        BigQuery rejects it together with ``OR REPLACE``.
+        """
+        if not self._cursor.match_keyword("IF"):
+            return False
+        self._cursor.advance()
+        # NOT and EXISTS lex as identifiers, not keywords.
+        for word in ("NOT", "EXISTS"):
+            tok = self._cursor.current
+            if tok.kind not in ("KEYWORD", "IDENT") or tok.value.upper() != word:
+                raise InvalidQueryError(f"Expected {word!r} after IF, got {tok.kind}:{tok.value!r}")
+            self._cursor.advance()
+        if or_replace:
+            raise InvalidQueryError("OR REPLACE and IF NOT EXISTS cannot both be specified")
+        return True
+
+    def _parse_function_rest(
+        self, *, or_replace: bool, table_fn: bool, if_not_exists: bool = False
+    ) -> CreateFunctionStmt:
         name = self._read_dotted_name()
         args = self._parse_routine_arg_list(for_procedure=False)
         return_type: dict[str, Any] | None = None
@@ -580,9 +604,12 @@ class Parser:
             body=body,
             or_replace=or_replace,
             routine_type="TABLE_VALUED_FUNCTION" if table_fn else "SCALAR_FUNCTION",
+            if_not_exists=if_not_exists,
         )
 
-    def _parse_procedure_rest(self, *, or_replace: bool) -> CreateProcedureStmt:
+    def _parse_procedure_rest(
+        self, *, or_replace: bool, if_not_exists: bool = False
+    ) -> CreateProcedureStmt:
         name = self._read_dotted_name()
         args = self._parse_routine_arg_list(for_procedure=True)
         self._cursor.expect_keyword("BEGIN")
@@ -594,6 +621,7 @@ class Parser:
             arguments=tuple(a for a in args if len(a) == _PROCEDURE_ARG_TUPLE_LEN),
             body=body,
             or_replace=or_replace,
+            if_not_exists=if_not_exists,
         )
 
     def _parse_routine_arg_list(
@@ -948,8 +976,13 @@ def _unquote_string(raw: str) -> str:
     string syntax. The lexer captures the source bytes verbatim — this
     helper strips the quotes and decodes the escapes so downstream
     consumers (JS UDF bodies, SQL UDF bodies, scripting RAISE messages)
-    see the same string BigQuery sees.
+    see the same string BigQuery sees. A raw literal (``r'...'``, or the
+    triple-quoted form) keeps its backslashes: that is how JS UDF bodies
+    with regexes are usually written.
     """
+    is_raw = raw[:1] in ("r", "R")
+    if is_raw:
+        raw = raw[1:]
     inner: str
     if (raw.startswith("'''") and raw.endswith("'''")) or (
         raw.startswith('"""') and raw.endswith('"""')
@@ -959,7 +992,7 @@ def _unquote_string(raw: str) -> str:
         inner = raw[1:-1]
     else:
         return raw
-    if "\\" not in inner:
+    if is_raw or "\\" not in inner:
         return inner
     return _decode_bq_string_escapes(inner)
 

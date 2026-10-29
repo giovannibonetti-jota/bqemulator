@@ -123,7 +123,7 @@ class RaiseStmt(Statement):
 
 @dataclass(frozen=True, slots=True)
 class CreateFunctionStmt(Statement):
-    """``CREATE [OR REPLACE] [TEMP] FUNCTION ... AS (body)``."""
+    """``CREATE [OR REPLACE] [TEMP] FUNCTION [IF NOT EXISTS] ... AS (body)``."""
 
     name: str  # dotted; may be 1-, 2-, or 3-part
     arguments: tuple[tuple[str, dict[str, Any] | None], ...]
@@ -132,16 +132,18 @@ class CreateFunctionStmt(Statement):
     body: str
     or_replace: bool = False
     routine_type: str = "SCALAR_FUNCTION"  # "SCALAR_FUNCTION" | "TABLE_VALUED_FUNCTION"
+    if_not_exists: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class CreateProcedureStmt(Statement):
-    """``CREATE [OR REPLACE] PROCEDURE ... BEGIN ... END;``."""
+    """``CREATE [OR REPLACE] PROCEDURE [IF NOT EXISTS] ... BEGIN ... END;``."""
 
     name: str
     arguments: tuple[tuple[str, dict[str, Any] | None, str], ...]  # (name, type, mode)
     body: str  # raw body — parsed on first invocation
     or_replace: bool = False
+    if_not_exists: bool = False
 
 
 @dataclass(frozen=True, slots=True)

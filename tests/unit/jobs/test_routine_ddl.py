@@ -145,6 +145,26 @@ class TestResolveCreateRoutineOperation:
         """A procedure has no ``ddlOperationPerformed`` (it reports SCRIPT)."""
         assert resolve_create_routine_operation(parse_script(_PROC), "p", ctx) == ""
 
+    async def test_if_not_exists_fresh_is_create(self, ctx: AppContext) -> None:
+        script = parse_script(
+            "CREATE FUNCTION IF NOT EXISTS `p.ds.f`(x INT64) RETURNS INT64 AS (x)"
+        )
+        assert resolve_create_routine_operation(script, "p", ctx) == "CREATE"
+
+    async def test_if_not_exists_existing_is_skip(self, ctx: AppContext) -> None:
+        """``IF NOT EXISTS`` over an existing routine reports SKIP and leaves it untouched."""
+        await _run(ctx, "c1", _SCALAR)
+        script = parse_script(
+            "CREATE FUNCTION IF NOT EXISTS `p.ds.f`(x INT64) RETURNS INT64 AS (x + 9)",
+        )
+        assert resolve_create_routine_operation(script, "p", ctx) == "SKIP"
+        await _run(
+            ctx, "c2", "CREATE FUNCTION IF NOT EXISTS `p.ds.f`(x INT64) RETURNS INT64 AS (x + 9)"
+        )
+        routine = ctx.catalog.get_routine("p", "ds", "f")
+        assert routine is not None
+        assert "+ 9" not in routine.definition_body
+
 
 class TestDetectDropRoutine:
     """``detect_drop_routine`` recognises the three routine-drop forms."""
