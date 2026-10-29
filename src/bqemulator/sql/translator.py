@@ -30,6 +30,7 @@ from bqemulator.sql.rewriter.aggregate_variants import rewrite_aggregate_variant
 from bqemulator.sql.rewriter.alter_table_set_options import (
     rewrite_alter_table_set_options,
 )
+from bqemulator.sql.rewriter.array_offset import rewrite_array_offset
 from bqemulator.sql.rewriter.collate_specifier import rewrite_collate_specifier
 from bqemulator.sql.rewriter.create_table_schema_ctas import (
     rewrite_create_table_schema_ctas,
@@ -272,6 +273,9 @@ class SQLTranslator:
         #     named, and the resulting mixed array would fail DuckDB's
         #     field-name binder on the outer ``SELECT label, value``.
         bq_sql_for_transpile = rewrite_unnest_struct(bq_sql_for_transpile)
+        # 2h-pre-b. ``arr[OFFSET(expr)]`` with a computed index: SQLGlot
+        #     only shifts literal indexes to DuckDB's 1-based brackets.
+        bq_sql_for_transpile = rewrite_array_offset(bq_sql_for_transpile)
         # 2h. Struct-helpers pre-translator: rewrite positional
         #     ``STRUCT(value, value, …)`` to DuckDB's ``ROW(…)`` so the
         #     struct aligns *positionally* with its target — matching

@@ -155,6 +155,7 @@ table below maps each BigQuery view to its rewriter function.
 | Category | BigQuery surface | DuckDB equivalent | Rule / function |
 |---|---|---|---|
 | Pre-translator (aggregate variants) | Pre-translate BigQuery aggregate variants DuckDB rejects | — | `rewrite_aggregate_variants` |
+| Pre-translator (array OFFSET index) | `arr[OFFSET(expr)]` | `arr[ORDINAL(expr + 1)]` for a non-literal `expr` | `rewrite_array_offset` |
 | Pre-translator (COLLATE) | Pre-translate BigQuery SQL for the `COLLATE(value, specifier)` form | — | `rewrite_collate_specifier` |
 | Pre-translator (CTAS schema) | Convert combined `CREATE TABLE x (schema) AS SELECT …` to bare CTAS | — | `rewrite_create_table_schema_ctas` |
 | Pre-translator (date / time) | Pre-translate BigQuery SQL for date/time functions with lossy transpiles | — | `rewrite_datetime_helpers` |
@@ -178,7 +179,6 @@ table below maps each BigQuery view to its rewriter function.
 | Pre-translator (UNNEST STRUCT aliases) | Propagate named-struct field aliases inside `UNNEST([...])` arrays | — | `rewrite_unnest_struct` |
 | Pre-translator (wildcard tables) | Expand every wildcard table reference in `bq_sql` | — | `expand_wildcard_tables` |
 | Other rewriter | Return a no-op statement when `bq_sql` is `ALTER TABLE ... SET OPTIONS(...)` | — | `rewrite_alter_table_set_options` |
-| Other rewriter | `arr[OFFSET(expr)]` | `arr[ORDINAL(expr + 1)]` for a non-literal `expr` | `rewrite_array_offset` |
 | Other rewriter | Pre-translate BigQuery SQL for every caller-identity spelling | — | `rewrite_session_user` |
 
 <!-- END AUTO-GENERATED RULE REGISTRY -->

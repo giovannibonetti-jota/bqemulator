@@ -91,6 +91,7 @@ _RULE_CATEGORY_DISPLAY: dict[str, str] = {
 #: leaves alone.
 _REWRITER_CATEGORY_DISPLAY: dict[str, str] = {
     "aggregate_variants": "Pre-translator (aggregate variants)",
+    "array_offset": "Pre-translator (array OFFSET index)",
     "collate_specifier": "Pre-translator (COLLATE)",
     "create_table_schema_ctas": "Pre-translator (CTAS schema)",
     "datetime_helpers": "Pre-translator (date / time)",
