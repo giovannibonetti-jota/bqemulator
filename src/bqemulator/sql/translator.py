@@ -30,6 +30,7 @@ from bqemulator.sql.rewriter.aggregate_variants import rewrite_aggregate_variant
 from bqemulator.sql.rewriter.alter_table_set_options import (
     rewrite_alter_table_set_options,
 )
+from bqemulator.sql.rewriter.array_offset import rewrite_array_offset
 from bqemulator.sql.rewriter.collate_specifier import rewrite_collate_specifier
 from bqemulator.sql.rewriter.create_table_schema_ctas import (
     rewrite_create_table_schema_ctas,
@@ -54,6 +55,9 @@ from bqemulator.sql.rewriter.timestamp_iso_helpers import (
     rewrite_timestamp_iso_helpers,
 )
 from bqemulator.sql.rewriter.unnest_struct import rewrite_unnest_struct
+from bqemulator.sql.rewriter.unnest_struct_columns import (
+    expose_unnest_struct_columns,
+)
 from bqemulator.sql.rules import TranslationRule, get_all_rules
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -269,6 +273,9 @@ class SQLTranslator:
         #     named, and the resulting mixed array would fail DuckDB's
         #     field-name binder on the outer ``SELECT label, value``.
         bq_sql_for_transpile = rewrite_unnest_struct(bq_sql_for_transpile)
+        # 2h-pre-b. ``arr[OFFSET(expr)]`` with a computed index: SQLGlot
+        #     only shifts literal indexes to DuckDB's 1-based brackets.
+        bq_sql_for_transpile = rewrite_array_offset(bq_sql_for_transpile)
         # 2h. Struct-helpers pre-translator: rewrite positional
         #     ``STRUCT(value, value, …)`` to DuckDB's ``ROW(…)`` so the
         #     struct aligns *positionally* with its target — matching
@@ -427,10 +434,12 @@ class SQLTranslator:
         if schema is not None:
             tree, _qualified_ok = self._annotate_tree(tree, schema)
 
-        # ``expr.*`` select items need the type annotations above to
-        # name the struct's fields, and must be expanded before the
-        # rule walk so the per-field copies of ``expr`` get rewritten
-        # like any other subtree.
+        # ``FROM UNNEST(<array of STRUCT>)`` and ``expr.*`` need the
+        # type annotations above to name the struct's fields, and run
+        # before the rule walk so the subtrees they copy get rewritten
+        # like any other.
+        if expose_unnest_struct_columns(tree):
+            modified = True
         if expand_struct_star(tree):
             modified = True
 

@@ -91,6 +91,7 @@ _RULE_CATEGORY_DISPLAY: dict[str, str] = {
 #: leaves alone.
 _REWRITER_CATEGORY_DISPLAY: dict[str, str] = {
     "aggregate_variants": "Pre-translator (aggregate variants)",
+    "array_offset": "Pre-translator (array OFFSET index)",
     "collate_specifier": "Pre-translator (COLLATE)",
     "create_table_schema_ctas": "Pre-translator (CTAS schema)",
     "datetime_helpers": "Pre-translator (date / time)",
@@ -112,6 +113,7 @@ _REWRITER_CATEGORY_DISPLAY: dict[str, str] = {
     "timestamp_iso_helpers": "Pre-translator (TIMESTAMP ISO helpers)",
     "unnest_offset": "Pre-translator (UNNEST WITH OFFSET)",
     "unnest_struct": "Pre-translator (UNNEST STRUCT aliases)",
+    "unnest_struct_columns": "Post-translator (UNNEST STRUCT columns)",
     "wildcard_expander": "Pre-translator (wildcard tables)",
 }
 

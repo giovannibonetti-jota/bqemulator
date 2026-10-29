@@ -60,13 +60,33 @@ def _fields(payload: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 async def test_array_subquery_element_star_in_a_view(client: httpx.AsyncClient) -> None:
-    await _run(client, "CREATE TABLE ds.req (id INT64, query_param_values STRING)")
-    await _run(client, "INSERT INTO ds.req VALUES (1, 'a=1&b=2'), (2, NULL), (3, '')")
+    """The dbt model shape: fields zipped with values, aggregated into one struct, expanded."""
+    await _run(
+        client,
+        "CREATE TABLE ds.req (id INT64, query_param_fields JSON, query_param_values STRING)",
+    )
+    await _run(
+        client,
+        "INSERT INTO ds.req VALUES "
+        "(1, PARSE_JSON('[\"a\", \"b\"]'), '1&2'), "
+        "(2, PARSE_JSON('[\"a\"]'), NULL), "
+        "(3, PARSE_JSON('[]'), '')",
+    )
     await _run(
         client,
         "CREATE VIEW ds.req_view AS SELECT id, ARRAY("
-        "  SELECT AS STRUCT STRING_AGG(p, '&') AS query_string, COUNT(*) AS param_count"
-        "  FROM UNNEST(SPLIT(query_param_values, '&')) AS p WHERE LENGTH(p) > 0"
+        "  SELECT AS STRUCT"
+        "    STRING_AGG(CONCAT(query_param_field, '=', query_param_value), '&') AS query_string,"
+        "    COUNT(*) AS param_count"
+        "  FROM UNNEST(ARRAY("
+        "    SELECT AS STRUCT JSON_EXTRACT_SCALAR(field) AS query_param_field,"
+        "      CASE WHEN ARRAY_LENGTH(SPLIT(query_param_values, '&')) > idx"
+        "           THEN SPLIT(query_param_values, '&')[OFFSET(idx)] ELSE NULL END"
+        "        AS query_param_value"
+        "    FROM UNNEST(JSON_EXTRACT_ARRAY(query_param_fields)) AS field WITH OFFSET AS idx"
+        "  )) AS query_param"
+        "  WHERE LENGTH(query_param_field) > 0 AND query_param_value IS NOT NULL"
+        "    AND LENGTH(query_param_value) > 0"
         ")[OFFSET(0)].*, query_param_values AS raw FROM ds.req",
     )
 
@@ -78,7 +98,7 @@ async def test_array_subquery_element_star_in_a_view(client: httpx.AsyncClient) 
         ("raw", "STRING"),
     ]
     assert _rows(payload) == [
-        ["1", "a=1&b=2", "2", "a=1&b=2"],
+        ["1", "a=1&b=2", "2", "1&2"],
         ["2", None, "0", None],
         ["3", None, "0", ""],
     ]

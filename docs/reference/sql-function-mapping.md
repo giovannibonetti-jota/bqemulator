@@ -51,7 +51,7 @@ table below maps each BigQuery view to its rewriter function.
 > **Auto-generated.** Edit translation rules under [`src/bqemulator/sql/rules/`](https://github.com/jjviscomi/bqemulator/blob/main/src/bqemulator/sql/rules/) or rewriters under [`src/bqemulator/sql/rewriter/`](https://github.com/jjviscomi/bqemulator/blob/main/src/bqemulator/sql/rewriter/), then run `make function-mapping` to regenerate this block. The CI gate (`--check`) refuses to merge a PR whose committed registry has drifted from the live source. Per-rule docstring summaries are extracted as the cell text — if a cell reads wrong, edit the rule's docstring.
 
 - **Registered rules**: 92 (13 rule modules)
-- **Rewriter functions**: 25 (25 rewriter modules; the INFORMATION_SCHEMA rewriter has its own hand-maintained per-view table below)
+- **Rewriter functions**: 26 (26 rewriter modules; the INFORMATION_SCHEMA rewriter has its own hand-maintained per-view table below)
 
 ### Translation rules (post-transpile AST passes)
 
@@ -155,6 +155,7 @@ table below maps each BigQuery view to its rewriter function.
 | Category | BigQuery surface | DuckDB equivalent | Rule / function |
 |---|---|---|---|
 | Pre-translator (aggregate variants) | Pre-translate BigQuery aggregate variants DuckDB rejects | — | `rewrite_aggregate_variants` |
+| Pre-translator (array OFFSET index) | `arr[OFFSET(expr)]` | `arr[ORDINAL(expr + 1)]` for a non-literal `expr` | `rewrite_array_offset` |
 | Pre-translator (COLLATE) | Pre-translate BigQuery SQL for the `COLLATE(value, specifier)` form | — | `rewrite_collate_specifier` |
 | Pre-translator (CTAS schema) | Convert combined `CREATE TABLE x (schema) AS SELECT …` to bare CTAS | — | `rewrite_create_table_schema_ctas` |
 | Pre-translator (date / time) | Pre-translate BigQuery SQL for date/time functions with lossy transpiles | — | `rewrite_datetime_helpers` |
