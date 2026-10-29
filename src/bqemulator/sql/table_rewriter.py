@@ -299,11 +299,15 @@ def _rewrite_two_part(
 def _rewrite_schema_qualified_calls(tree: object, project_id: str) -> bool:
     """Flatten schema-qualified UDF / TVF call sites.
 
-    Handles two parser shapes:
+    Handles three parser shapes:
 
     1. ``Dot(Identifier, Anonymous)`` — the SQLGlot AST for
        ``dataset.routine(args)`` written without backticks. Becomes
        ``project__dataset__routine(args)``.
+
+    1b. ``Dot(Dot(Identifier, Identifier), Anonymous)`` — the same for
+       ``project.dataset.routine(args)``, with or without per-part
+       backticks (the form dbt renders for ``{{ function(...) }}``).
 
     2. ``Anonymous`` whose ``name`` itself contains dots — the AST for
        ``` `dataset.routine`(args) ``` (single backticked identifier
@@ -337,12 +341,21 @@ def _rewrite_dot_anonymous_calls(tree: object, project_id: str) -> bool:
     for dot_node in list(tree.find_all(exp.Dot)):
         left = dot_node.this
         right = dot_node.expression
-        if not isinstance(left, exp.Identifier) or not isinstance(right, exp.Anonymous):
+        if not isinstance(right, exp.Anonymous):
             continue
-        dataset = left.name
+        if isinstance(left, exp.Identifier):
+            project, dataset = project_id, left.name
+        elif (
+            isinstance(left, exp.Dot)
+            and isinstance(left.this, exp.Identifier)
+            and isinstance(left.expression, exp.Identifier)
+        ):
+            project, dataset = left.this.name, left.expression.name
+        else:
+            continue
         routine_name = right.name
         try:
-            flat_name = qualified_routine_name_parts(project_id, dataset, routine_name)
+            flat_name = qualified_routine_name_parts(project, dataset, routine_name)
         except ValidationError as exc:
             # SQL-boundary id whitelist rejected the dataset id —
             # usually a compound ``project.dataset`` back-ticked
