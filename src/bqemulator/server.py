@@ -272,6 +272,12 @@ class EmulatorServer:
         # Storage
         await self._engine.stop()
 
+        # JS UDF V8 contexts — closed explicitly: one left to the garbage
+        # collector at interpreter shutdown deadlocks in MiniRacer.__del__,
+        # and the ``bqemulator start`` process never exits.
+        if self._context is not None:
+            self._context.udf_registry.close()
+
     # -- Synchronous entry --------------------------------------------------
 
     def run_forever(self) -> None:
