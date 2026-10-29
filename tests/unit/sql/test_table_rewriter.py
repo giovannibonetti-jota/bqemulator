@@ -149,6 +149,22 @@ class TestTvfBacktickedCompoundQualifier:
         result = rewrite_table_refs(sql, "ignored")
         assert "PROJ__DS__ADD_ONE" in result
 
+    def test_project_qualified_function_call(self) -> None:
+        """``proj.ds.fn(args)`` — the form dbt renders for ``{{ function() }}`` — flattens."""
+        sql = 'SELECT "proj"."ds"."add_one"(41) AS r, proj.ds.add_two(1) AS s'
+        result = rewrite_table_refs(sql, "ignored")
+        assert "PROJ__DS__ADD_ONE(41)" in result
+        assert "PROJ__DS__ADD_TWO(1)" in result
+
+    def test_project_qualified_function_call_hyphenated_project(self) -> None:
+        sql = 'SELECT "my-proj"."ds"."add_one"(41) AS r'
+        result = rewrite_table_refs(sql, "ignored")
+        assert "MY_H_PROJ__DS__ADD_ONE(41)" in result
+
+    def test_struct_field_access_is_not_a_call(self) -> None:
+        """``t.a.b`` (no parentheses) is a column path and stays untouched."""
+        assert rewrite_table_refs("SELECT t.a.b AS x FROM t", "p") == "SELECT t.a.b AS x FROM t"
+
     def test_backticked_dotted_function_invalid_id_raises(self) -> None:
         """Invalid dataset characters surface as ``Function not found:`` ."""
         from bqemulator.domain.errors import InvalidQueryError
