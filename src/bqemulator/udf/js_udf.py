@@ -110,6 +110,23 @@ class JavaScriptUDFRuntime:
         )
         _log.debug("js_udf.registered", routine=routine.routine_id)
 
+    def close(self) -> None:
+        """Release every V8 context without touching DuckDB.
+
+        Called on server stop. A context left for garbage collection at
+        interpreter shutdown deadlocks in ``MiniRacer.__del__`` (it joins
+        the context's event-loop thread after threading has finalised),
+        so a ``bqemulator start`` process that ran a JS UDF never exits.
+        """
+        with self._lock:
+            contexts = list(self._contexts.values())
+            self._contexts.clear()
+        for context in contexts:
+            try:
+                context.mr.close()
+            except Exception as exc:  # noqa: BLE001 — close is best-effort
+                _log.warning("js_udf.close_failed", error=str(exc))
+
     def deregister(self, routine: RoutineMeta, engine: DuckDBEngine) -> None:
         """Remove the JS UDF from DuckDB and release the V8 context."""
         key = (routine.project_id, routine.dataset_id, routine.routine_id)

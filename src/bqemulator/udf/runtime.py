@@ -103,6 +103,11 @@ class UDFRegistry:
         self._routines.pop(key, None)
         _log.debug("udf.deregister", routine=routine.routine_id)
 
+    def close(self) -> None:
+        """Release runtime resources (the JS UDFs' V8 contexts) on server stop."""
+        self._js.close()
+        self._routines.clear()
+
     def hydrate(self, catalog: CatalogRepository, engine: DuckDBEngine) -> None:
         """Re-materialize every routine currently in the catalog.
 

@@ -244,3 +244,31 @@ class TestJSUDFRuntime:
         rt.deregister(r, engine)
         # Second deregister is idempotent.
         rt.deregister(r, engine)
+
+
+class TestUDFRegistryClose:
+    def test_close_releases_js_contexts(
+        self, engine: DuckDBEngine, ephemeral_settings: Settings
+    ) -> None:
+        """``close()`` drops every V8 context so interpreter shutdown cannot deadlock on them."""
+        pytest.importorskip("py_mini_racer")
+        now = datetime(2026, 5, 16, tzinfo=UTC)
+        registry = UDFRegistry(ephemeral_settings)
+        routine = RoutineMeta(
+            project_id="p",
+            dataset_id="ds",
+            routine_id="shout",
+            routine_type="SCALAR_FUNCTION",
+            language="JAVASCRIPT",
+            definition_body="return s + '!';",
+            arguments=(RoutineArgument(name="s", data_type={"typeKind": "STRING"}),),
+            return_type={"typeKind": "STRING"},
+            creation_time=now,
+            last_modified_time=now,
+            etag="e",
+        )
+        registry.materialize(routine, engine)
+        assert registry._js._contexts
+        registry.close()
+        assert registry._js._contexts == {}
+        registry.close()  # idempotent
