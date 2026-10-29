@@ -73,6 +73,7 @@ from bqemulator.scripting.frames import FrameStack
 from bqemulator.scripting.parser import parse_script
 from bqemulator.sql.inner_query import rewrite_and_translate_statement
 from bqemulator.sql.parameters import bind_parameters
+from bqemulator.sql.statement import parse_single_statement
 from bqemulator.sql.table_rewriter import rewrite_table_refs
 from bqemulator.sql.translator import SQLTranslator
 from bqemulator.udf.temp_registry import TempRoutineRegistry
@@ -81,7 +82,6 @@ from bqemulator.versioning.ddl import (
     VersioningDDLKind,
     VersioningDDLRouter,
     execute_versioning_ddl,
-    is_versioning_ddl,
 )
 
 if TYPE_CHECKING:
@@ -652,27 +652,30 @@ class ScriptInterpreter:
             # and only SELECT-like statements have one).
             self._final_table = None
             return
+        # One SQLGlot parse per statement; every router below dispatches
+        # on this tree (``None`` when SQLGlot rejects the statement, which
+        # the translator then reports).
+        tree = parse_single_statement(sql)
         # If we're inside a user-level transaction, snapshot each DML
         # target the first time it's modified. On ROLLBACK the snapshots
         # restore the pre-transaction state; on COMMIT or
         # exception-caught the snapshots are dropped and the DML stays
         # applied (matching BigQuery's documented EXCEPTION semantic).
         if self._active_txn is not None:
-            await self._snapshot_dml_targets(sql)
+            await self._snapshot_dml_targets(sql, tree=tree)
         # ADR 0023 §1.F — route versioning DDL (CREATE SNAPSHOT TABLE,
         # CREATE TABLE … CLONE, CREATE MATERIALIZED VIEW, DROP/REFRESH
         # equivalents) through the matching manager. DuckDB does not
         # support this syntax, and the managers carry the catalog +
         # storage side effects BigQuery wires into each statement.
-        if is_versioning_ddl(sql):
-            parsed = VersioningDDLRouter(self._project_id).parse(sql)
-            if parsed is not None:
-                await execute_versioning_ddl(parsed, self._ctx)
-                # Versioning DDL has no result set; reset ``_final_table``
-                # so a script ending here returns an empty result
-                # (last-statement-wins, matching BigQuery).
-                self._final_table = None
-                return
+        parsed = VersioningDDLRouter(self._project_id).parse(sql, tree=tree)
+        if parsed is not None:
+            await execute_versioning_ddl(parsed, self._ctx)
+            # Versioning DDL has no result set; reset ``_final_table``
+            # so a script ending here returns an empty result
+            # (last-statement-wins, matching BigQuery).
+            self._final_table = None
+            return
         # EXPORT DATA — run the inner SELECT through the standard query path
         # (so row-access / MV / wildcard rewrites apply), then write the
         # result to Cloud Storage. Non-row-producing, so reset
@@ -680,7 +683,7 @@ class ScriptInterpreter:
         # an import cycle (the executor imports this interpreter).
         from bqemulator.jobs.executor import parse_export_data, write_export
 
-        export_request = parse_export_data(sql)
+        export_request = parse_export_data(sql, tree=tree)
         if export_request is not None:
             exported = await self._run_query(export_request.select_sql)
             # Serialise the register/unregister + COPY on the shared DuckDB
@@ -691,7 +694,7 @@ class ScriptInterpreter:
             self._final_table = None
             return
         # CREATE MODEL: register surface-only model metadata (ADR 0047 / RFC 0002).
-        if await self._maybe_register_create_model(sql):
+        if await self._maybe_register_create_model(sql, tree=tree):
             return
         # Reject a bare / RESTRICT DROP SCHEMA on a non-empty dataset with
         # BigQuery's ``resourceInUse`` error before DuckDB runs — same guard
@@ -710,7 +713,7 @@ class ScriptInterpreter:
         # (``_invoke_procedure`` / ``_run_statement_with_params``): the
         # invoked or dynamic statement's result wins, and resets to empty
         # when it produces none.
-        if _is_row_producing(sql):
+        if isinstance(tree, exp.Query):
             self._final_table = table
         else:
             self._final_table = None
@@ -758,11 +761,11 @@ class ScriptInterpreter:
             await self._restore_txn_snapshots()
             return
 
-    async def _snapshot_dml_targets(self, sql: str) -> None:
+    async def _snapshot_dml_targets(self, sql: str, *, tree: exp.Expr | None = None) -> None:
         """Snapshot every DML target referenced by ``sql`` once per transaction."""
         if self._active_txn is None:
             return
-        for quoted_target in _dml_targets(sql, self._project_id):
+        for quoted_target in _dml_targets(sql, self._project_id, tree=tree):
             if quoted_target in self._active_txn:
                 continue
             backup = f"_bqemu_txn_{uuid.uuid4().hex[:16]}"
@@ -856,6 +859,7 @@ class ScriptInterpreter:
         sql: str,
         *,
         using_values: list[Any] | None = None,
+        tree: exp.Expr | None = None,
     ) -> bool:
         """Intercept a ``CREATE MODEL`` statement, registering it; return True if handled.
 
@@ -879,7 +883,7 @@ class ScriptInterpreter:
             training_schema_sql,
         )
 
-        request = parse_create_model(sql)
+        request = parse_create_model(sql, tree=tree)
         if request is None:
             return False
         if using_values:
@@ -1205,7 +1209,7 @@ def _classify_txn_statement(bq_sql: str) -> str | None:
     return None
 
 
-def _dml_targets(bq_sql: str, project_id: str) -> list[str]:
+def _dml_targets(bq_sql: str, project_id: str, *, tree: exp.Expr | None = None) -> list[str]:
     """Return the quoted DuckDB target table(s) modified by ``bq_sql``.
 
     The result is the same ``"<project>__<dataset>"."<table>"`` form
@@ -1220,10 +1224,11 @@ def _dml_targets(bq_sql: str, project_id: str) -> list[str]:
     "DDL inside a transaction is auto-committed at statement boundary"
     semantic.
     """
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 — best-effort identification
-        return []
+    if tree is None:
+        try:
+            tree = sqlglot.parse_one(bq_sql, read="bigquery")
+        except Exception:  # noqa: BLE001 — best-effort identification
+            return []
     if not isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         return []
     target = tree.this

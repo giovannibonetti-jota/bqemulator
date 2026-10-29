@@ -217,9 +217,17 @@ class MaterializedViewManager:
         project_id: str,
         dataset_id: str,
         table_id: str,
+        *,
+        if_exists: bool = False,
     ) -> None:
-        """Drop an MV and clear its subscriptions."""
+        """Drop an MV and clear its subscriptions.
+
+        ``if_exists`` makes a missing view a no-op; a table of another
+        type under that name is still an error, as in BigQuery.
+        """
         existing_table = self._ctx.catalog.get_table(project_id, dataset_id, table_id)
+        if existing_table is None and if_exists:
+            return
         if existing_table is None or existing_table.table_type != "MATERIALIZED_VIEW":
             raise resource_not_found(
                 ResourceRef("materialized_view", project_id, dataset_id, table_id),

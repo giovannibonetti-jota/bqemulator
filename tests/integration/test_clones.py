@@ -119,3 +119,19 @@ async def test_clone_missing_source_returns_404(
     assert r.status_code == 200
     body = r.json()
     assert body["errors"][0]["reason"] == "notFound"
+
+
+async def test_clone_if_not_exists_and_or_replace(client: httpx.AsyncClient) -> None:
+    """The ``IF NOT EXISTS`` / ``OR REPLACE`` forms route to the clone manager.
+
+    Before routing on SQLGlot's ``exp.Create`` the regex only knew the bare
+    form, so these fell through to DuckDB and failed.
+    """
+    await _run(client, "INSERT INTO ds.t VALUES (1, 'a')")
+    await _run(client, '/* {"app": "dbt"} */ CREATE TABLE IF NOT EXISTS ds.workcopy CLONE ds.t')
+    # Second IF NOT EXISTS is a no-op, not an "already exists" error.
+    await _run(client, "CREATE TABLE IF NOT EXISTS ds.workcopy CLONE ds.t")
+    await _run(client, "INSERT INTO ds.t VALUES (2, 'b')")
+    await _run(client, "CREATE OR REPLACE TABLE ds.workcopy CLONE ds.t")
+    rows = _rows(await _run(client, "SELECT id FROM ds.workcopy ORDER BY id"))
+    assert rows == [["1"], ["2"]]

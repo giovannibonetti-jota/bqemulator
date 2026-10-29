@@ -494,3 +494,17 @@ async def test_cluster_and_partition_columns_must_be_outputs(client: httpx.Async
         "SELECT country FROM ds.orders",
     )
     assert "bad" not in await _table_ids(client)
+
+
+async def test_drop_materialized_view_if_exists(client: httpx.AsyncClient) -> None:
+    """``IF EXISTS`` makes a missing view a no-op; a comment-prefixed DROP still routes."""
+    await _run(client, "DROP MATERIALIZED VIEW IF EXISTS ds.never_created")
+    await _run(client, "INSERT INTO ds.orders VALUES ('US', 1)")
+    await _run(
+        client,
+        "CREATE MATERIALIZED VIEW ds.totals AS SELECT SUM(amount) AS total FROM ds.orders",
+    )
+    await _run(client, '/* {"app": "dbt"} */ DROP MATERIALIZED VIEW IF EXISTS `p.ds.totals`;')
+    r = await client.get("/bigquery/v2/projects/p/datasets/ds/tables")
+    table_ids = [t["tableReference"]["tableId"] for t in r.json().get("tables", [])]
+    assert "totals" not in table_ids

@@ -132,6 +132,23 @@ class TestClassifyAndParse:
         """A non-EXPORT statement is not parsed as an export request."""
         assert parse_export_data("SELECT 1 AS a") is None
 
+    @pytest.mark.parametrize("prefix", ['/* {"app": "dbt"} */ ', "-- a comment\n"])
+    def test_comment_prefixed_export_parses(self, prefix: str) -> None:
+        """Routing on ``exp.Export`` sees through the comments dbt prefixes."""
+        req = parse_export_data(
+            prefix + "EXPORT DATA OPTIONS(uri='gs://b/o/*.csv') AS SELECT 1 AS a"
+        )
+        assert req is not None
+        assert req.options.uri == "gs://b/o/*.csv"
+
+    def test_pre_parsed_tree_is_honoured(self) -> None:
+        """The executor's single parse feeds the gate; a non-export tree short-circuits."""
+        from bqemulator.sql.statement import parse_single_statement
+
+        sql = "EXPORT DATA OPTIONS(uri='gs://b/o/*.csv') AS SELECT 1 AS a"
+        assert parse_export_data(sql, tree=parse_single_statement(sql)) is not None
+        assert parse_export_data(sql, tree=parse_single_statement("SELECT 1 AS a")) is None
+
     def test_inner_select_and_options_extracted(self) -> None:
         """The inner SELECT text and OPTIONS round-trip out of the AST."""
         req = parse_export_data(

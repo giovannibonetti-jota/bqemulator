@@ -90,3 +90,38 @@ async def test_clone_missing_destination_dataset_raises(
     manager = CloneManager(full_ctx)
     with pytest.raises(NotFoundError):
         await manager.create("p", "missing_ds", "x", "p", "ds", "t")
+
+
+async def test_clone_if_not_exists_returns_existing_untouched(
+    full_ctx: AppContext,
+    make_dataset,
+    make_table,
+) -> None:
+    make_dataset("p", "ds")
+    make_table("p", "ds", "t", rows=[(1, "a"), (2, "b")])
+    make_table("p", "ds", "existing", rows=[(9, "z")])
+    manager = CloneManager(full_ctx)
+    meta = await manager.create("p", "ds", "existing", "p", "ds", "t", if_not_exists=True)
+    assert meta.table_type == "TABLE"
+    rows = full_ctx.engine.execute(
+        f"SELECT id FROM {quoted_table_ref('p', 'ds', 'existing')}",
+    ).fetchall()
+    assert rows == [(9,)]
+
+
+async def test_clone_replace_recreates_from_source(
+    full_ctx: AppContext,
+    make_dataset,
+    make_table,
+) -> None:
+    make_dataset("p", "ds")
+    make_table("p", "ds", "t", rows=[(1, "a"), (2, "b")])
+    make_table("p", "ds", "existing", rows=[(9, "z")])
+    manager = CloneManager(full_ctx)
+    meta = await manager.create("p", "ds", "existing", "p", "ds", "t", replace=True)
+    assert meta.table_type == "CLONE"
+    rows = full_ctx.engine.execute(
+        f"SELECT id FROM {quoted_table_ref('p', 'ds', 'existing')} ORDER BY id",
+    ).fetchall()
+    assert rows == [(1,), (2,)]
+    assert full_ctx.catalog.get_table("p", "ds", "existing").table_type == "CLONE"
