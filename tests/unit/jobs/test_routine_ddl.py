@@ -187,7 +187,7 @@ class TestDetectDropRoutine:
         assert ref.statement_type == "DROP_PROCEDURE"
 
     def test_drop_table_function(self) -> None:
-        """DROP TABLE FUNCTION is matched by regex (sqlglot can't parse it)."""
+        """DROP TABLE FUNCTION goes through the DDL-head grammar (sqlglot can't parse it)."""
         ref = detect_drop_routine("DROP TABLE FUNCTION `p.ds.tvf`", "p")
         assert ref is not None
         assert ref.statement_type == "DROP_TABLE_FUNCTION"

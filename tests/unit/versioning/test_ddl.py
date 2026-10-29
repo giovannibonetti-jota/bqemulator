@@ -234,10 +234,15 @@ def test_parse_drop_plain_view_is_not_versioning_ddl() -> None:
 
 
 def test_parse_rejects_multi_statement_input() -> None:
-    """A second statement after the DDL must not be swallowed into the view body."""
+    """A second statement after the DDL is never swallowed into the statement.
+
+    SQLGlot-typed heads simply do not match; a head the grammar owns reports
+    the trailing statement as the syntax error BigQuery would raise.
+    """
     router = VersioningDDLRouter("p")
     assert router.parse("CREATE MATERIALIZED VIEW ds.mv AS SELECT 1 AS x; SELECT 2") is None
-    assert router.parse("CREATE TABLE ds.copy CLONE ds.t; SELECT 2") is None
+    with pytest.raises(InvalidQueryError, match="end of statement"):
+        router.parse("CREATE SNAPSHOT TABLE ds.copy CLONE ds.t; SELECT 2")
 
 
 def test_parse_accepts_a_pre_parsed_tree() -> None:

@@ -10,7 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -56,6 +55,12 @@ from bqemulator.row_access.identity import CallerIdentity
 from bqemulator.scripting.ast import SqlStmt
 from bqemulator.scripting.interpreter import ScriptInterpreter
 from bqemulator.scripting.parser import parse_script
+from bqemulator.sql.ddl_heads import (
+    CreateRowAccessPolicy,
+    DropAllRowAccessPolicies,
+    DropRowAccessPolicy,
+    parse_ddl_head,
+)
 from bqemulator.sql.inner_query import rewrite_and_translate_statement
 from bqemulator.sql.parameters import bind_parameters
 from bqemulator.sql.statement import parse_single_statement
@@ -583,17 +588,18 @@ async def _run_query_fast_paths(
         project_id=project_id,
         job_id=job_id,
         bq_sql=bq_sql,
+        tree=tree,
         now=now,
         ctx=ctx,
     )
     if routine_drop is not None:
         return routine_drop
-    rap_result = _maybe_run_row_access_ddl(project_id, bq_sql, ctx)
+    rap_result = _maybe_run_row_access_ddl(project_id, bq_sql, ctx, tree=tree)
     if rap_result is not None:
-        # ``classify_statement_type`` recognises both the CREATE and DROP
-        # RAP forms via the same regexes the handler dispatched on, so
-        # this is the correct type for either branch (a bare hardcoded
-        # ``CREATE_ROW_ACCESS_POLICY`` would mislabel DROPs).
+        # ``classify_statement_type`` recognises the CREATE and DROP RAP
+        # forms through the same DDL-head grammar the handler dispatched
+        # on, so this is the correct type for either branch (a bare
+        # hardcoded ``CREATE_ROW_ACCESS_POLICY`` would mislabel DROPs).
         return _build_ddl_job_meta(
             project_id=project_id,
             job_id=job_id,
@@ -664,6 +670,7 @@ async def _maybe_run_routine_drop(
     project_id: str,
     job_id: str,
     bq_sql: str,
+    tree: exp.Expr | None,
     now: Any,
     ctx: AppContext,
 ) -> JobMeta | None:
@@ -677,7 +684,7 @@ async def _maybe_run_routine_drop(
     ``DROP_PROCEDURE`` / ``DROP_TABLE_FUNCTION``) with ``DROP`` / ``SKIP``.
     Returns ``None`` for every non-routine statement.
     """
-    ref = detect_drop_routine(bq_sql, project_id)
+    ref = detect_drop_routine(bq_sql, project_id, tree=tree)
     if ref is None:
         return None
     operation = await run_drop_routine(ref, ctx)
@@ -2699,61 +2706,9 @@ async def _maybe_run_versioning_ddl(
     return pa.table({})
 
 
-# BigQuery ``CREATE ROW ACCESS POLICY`` grammar:
-#
-#     CREATE [OR REPLACE] ROW ACCESS POLICY [IF NOT EXISTS] <policy>
-#       ON <table>
-#       [GRANT TO (<grantee_list>)]
-#       FILTER USING (<bool_expr>);
-#
-# Pattern notes:
-# * ``IF NOT EXISTS`` is optional (mirrors the DROP form's ``IF EXISTS``).
-# * ``GRANT TO`` is optional — BigQuery applies a grantee-less policy to
-#   every principal that can query the table; the handler defaults the
-#   grantee list accordingly.
-# * The policy id and table ref may be backtick-quoted (whole or
-#   per-component) and the table ref may carry hyphenated project ids;
-#   ``_resolve_table_parts`` strips backticks per component.
-# * Callers pass the SQL through ``_strip_trailing_semicolon`` first, so
-#   the patterns anchor directly on ``)`` / end-of-string. The grantee
-#   and filter captures are *greedy* and have no adjacent ``\s*`` runs:
-#   two unbounded whitespace-matching quantifiers over the same input
-#   (the old ``.+?\s*\)\s*;?\s*\Z`` tail) is the polynomial-backtracking
-#   shape CodeQL flags as ReDoS. ``.+\)`` anchored on ``\Z`` is linear —
-#   only the final ``)`` can satisfy ``\)\Z`` — and inner whitespace is
-#   trimmed by the handler, not the regex.
-_RAP_CREATE_RE = re.compile(
-    r"""
-    CREATE\s+(?:OR\s+REPLACE\s+)?ROW\s+ACCESS\s+POLICY\s+
-    (?:IF\s+NOT\s+EXISTS\s+)?
-    `?(?P<policy>[A-Za-z_][A-Za-z0-9_]*)`?\s+
-    ON\s+(?P<table>[`\w.-]+)\s+
-    (?:GRANT\s+TO\s*\((?P<grantees>[^)]+)\)\s+)?
-    FILTER\s+USING\s*\((?P<filter>.+)\)
-    \Z
-    """,
-    re.IGNORECASE | re.VERBOSE | re.DOTALL,
-)
-_RAP_DROP_RE = re.compile(
-    r"""
-    DROP\s+ROW\s+ACCESS\s+POLICY\s+(?:IF\s+EXISTS\s+)?
-    `?(?P<policy>[A-Za-z_][A-Za-z0-9_]*)`?\s+
-    ON\s+(?P<table>[`\w.-]+)
-    \Z
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _strip_trailing_semicolon(sql: str) -> str:
-    """Trim surrounding whitespace and a single trailing ``;`` from ``sql``.
-
-    The RAP DDL detectors anchor on ``)`` / end-of-string with no
-    optional trailing-token quantifiers, so the statement terminator is
-    normalised here rather than in the patterns (see the note above).
-    """
-    return sql.strip().removesuffix(";").strip()
-
+# ---------------------------------------------------------------------------
+# Row access policy DDL — CREATE / DROP / DROP ALL ROW ACCESS POLICY
+# ---------------------------------------------------------------------------
 
 _TABLE_REF_THREE_PART = 3
 _TABLE_REF_TWO_PART = 2
@@ -2777,62 +2732,77 @@ def _maybe_run_row_access_ddl(
     project_id: str,
     bq_sql: str,
     ctx: AppContext,
+    *,
+    tree: exp.Expr | None,
 ) -> pa.Table | None:
-    """Detect + execute ``CREATE / DROP ROW ACCESS POLICY`` DDL.
+    """Detect + execute ``CREATE / DROP [ALL] ROW ACCESS POLICY`` DDL.
 
     ``bq query`` is the canonical CLI for managing RAPs (the REST
     ``rowAccessPolicies`` resource is also supported by the SDK
-    clients); BigQuery's ``CREATE ROW ACCESS POLICY`` syntax is:
+    clients). SQLGlot has no grammar for the statements — ``tree`` is an
+    opaque ``exp.Command`` — so the DDL-head grammar parses them::
 
-        CREATE [OR REPLACE] ROW ACCESS POLICY <id>
+        CREATE [OR REPLACE] ROW ACCESS POLICY [IF NOT EXISTS] <id>
           ON <table>
-          GRANT TO ('<grantee>', '<grantee>', ...)
+          [GRANT TO ('<grantee>', '<grantee>', ...)]
           FILTER USING (<boolean-expr>);
-
-    and the matching ``DROP ROW ACCESS POLICY <id> ON <table>``.
+        DROP ROW ACCESS POLICY [IF EXISTS] <id> ON <table>;
+        DROP ALL ROW ACCESS POLICIES ON <table>;
     """
-    sql = _strip_trailing_semicolon(bq_sql)
-    create_match = _RAP_CREATE_RE.match(sql)
-    drop_match = _RAP_DROP_RE.match(sql)
-    if create_match is None and drop_match is None:
+    from sqlglot import exp as sqlglot_exp
+
+    if not isinstance(tree, sqlglot_exp.Command):
         return None
-    if create_match is not None:
-        proj, ds, tbl = _resolve_table_parts(
-            create_match.group("table"),
-            project_id,
-        )
-        grantees_raw = create_match.group("grantees")
-        if grantees_raw:
-            grantees = tuple(g.strip().strip("'\"") for g in grantees_raw.split(",") if g.strip())
-        else:
-            # BigQuery applies a policy created without a GRANT TO clause
-            # to every principal that can query the table. Default to
-            # ``allAuthenticatedUsers`` — the closest emulator analogue of
-            # "anyone with query access" (the matcher admits any
-            # authenticated caller; the bare empty tuple would match no
-            # one, which is the opposite of BigQuery's semantic).
-            grantees = ("allAuthenticatedUsers",)
+    head = parse_ddl_head(bq_sql)
+    if isinstance(head, CreateRowAccessPolicy):
+        proj, ds, tbl = _resolve_table_parts(head.table, project_id)
+        if ctx.row_access.get(proj, ds, tbl, head.policy) is not None:
+            if head.if_not_exists:
+                return pa.table({})
+            if head.replace:
+                ctx.row_access.delete(
+                    project_id=proj,
+                    dataset_id=ds,
+                    table_id=tbl,
+                    policy_id=head.policy,
+                )
+        # BigQuery applies a policy created without a GRANT TO clause to
+        # every principal that can query the table. Default to
+        # ``allAuthenticatedUsers`` — the closest emulator analogue of
+        # "anyone with query access" (the matcher admits any authenticated
+        # caller; the bare empty tuple would match no one, which is the
+        # opposite of BigQuery's semantic).
         ctx.row_access.create(
             project_id=proj,
             dataset_id=ds,
             table_id=tbl,
-            policy_id=create_match.group("policy"),
-            filter_predicate=create_match.group("filter").strip(),
-            grantees=grantees,
+            policy_id=head.policy,
+            filter_predicate=head.filter,
+            grantees=head.grantees or ("allAuthenticatedUsers",),
         )
         return pa.table({})
-    assert drop_match is not None  # noqa: S101
-    proj, ds, tbl = _resolve_table_parts(
-        drop_match.group("table"),
-        project_id,
-    )
-    ctx.row_access.delete(
-        project_id=proj,
-        dataset_id=ds,
-        table_id=tbl,
-        policy_id=drop_match.group("policy"),
-    )
-    return pa.table({})
+    if isinstance(head, DropRowAccessPolicy):
+        proj, ds, tbl = _resolve_table_parts(head.table, project_id)
+        ctx.row_access.delete(
+            project_id=proj,
+            dataset_id=ds,
+            table_id=tbl,
+            policy_id=head.policy,
+            not_found_ok=head.if_exists,
+        )
+        return pa.table({})
+    if isinstance(head, DropAllRowAccessPolicies):
+        proj, ds, tbl = _resolve_table_parts(head.table, project_id)
+        policy_ids = tuple(p.policy_id for p in ctx.row_access.list_for_table(proj, ds, tbl))
+        if policy_ids:
+            ctx.row_access.batch_delete(
+                project_id=proj,
+                dataset_id=ds,
+                table_id=tbl,
+                policy_ids=policy_ids,
+            )
+        return pa.table({})
+    return None
 
 
 def _reject_dml_on_immutable(
@@ -3022,39 +2992,41 @@ def classify_statement_type(bq_sql: str, tree: exp.Expr | None = None) -> str:
     ``CREATE_VIEW``, ``CREATE_FUNCTION``, ``CREATE_PROCEDURE``,
     ``CREATE_SCHEMA``, ``CREATE_SNAPSHOT_TABLE``, ``DROP_TABLE``,
     ``DROP_VIEW``, ``DROP_FUNCTION``, ``DROP_PROCEDURE``,
-    ``DROP_SCHEMA``, ``DROP_SNAPSHOT_TABLE``, ``ALTER_TABLE``,
-    ``TRUNCATE_TABLE``, ``CREATE_ROW_ACCESS_POLICY``,
+    ``DROP_SCHEMA``, ``DROP_SNAPSHOT_TABLE``, ``DROP_TABLE_FUNCTION``,
+    ``ALTER_TABLE``, ``TRUNCATE_TABLE``, ``CREATE_ROW_ACCESS_POLICY``,
     ``DROP_ROW_ACCESS_POLICY``, ``SCRIPT``, or ``""`` (empty when
-    sqlglot cannot parse the SQL — caller writes no ``statementType``
-    field in that case).
+    neither sqlglot nor the DDL-head grammar recognises the SQL — the
+    caller writes no ``statementType`` field in that case).
 
     Falls back to ``""`` rather than guessing for unparseable input so
     a malformed query doesn't get a misleading classification.
     """
-    rap_type = _classify_rap_ddl(bq_sql)
-    if rap_type:
-        return rap_type
+    from sqlglot import exp as sqlglot_exp
+
     if tree is None:
         tree = _parse_for_classification(bq_sql)
     if tree is None:
-        return ""
-    return _classify_parsed_tree(tree)
+        return _classify_untyped(bq_sql)
+    typed = _classify_parsed_tree(tree)
+    if typed or not isinstance(tree, sqlglot_exp.Command):
+        return typed
+    return _classify_untyped(bq_sql)
 
 
-def _classify_rap_ddl(bq_sql: str) -> str:
-    """Pre-classify ``CREATE/DROP ROW ACCESS POLICY`` DDL via regex.
+def _classify_untyped(bq_sql: str) -> str:
+    """``statementType`` of a head sqlglot cannot type (``""`` when it is not one).
 
-    ``ROW ACCESS POLICY`` DDL is not in sqlglot's BigQuery grammar — it
-    falls back to a generic ``Command`` node — so we classify it via
-    the same regexes the executor uses to dispatch the DDL, before the
-    parse-based path runs.
+    ``ROW ACCESS POLICY``, snapshot and ``DROP TABLE FUNCTION`` DDL come
+    back from sqlglot as a generic ``Command`` node or a parse error, so
+    they are classified through the same DDL-head grammar the executor
+    dispatches on. Best-effort like the rest of classification: a
+    malformed head is reported by the fast path that executes it.
     """
-    rap_sql = _strip_trailing_semicolon(bq_sql)
-    if _RAP_CREATE_RE.match(rap_sql):
-        return "CREATE_ROW_ACCESS_POLICY"
-    if _RAP_DROP_RE.match(rap_sql):
-        return "DROP_ROW_ACCESS_POLICY"
-    return ""
+    try:
+        head = parse_ddl_head(bq_sql)
+    except InvalidQueryError:
+        return ""
+    return head.statement_type if head is not None else ""
 
 
 def _parse_for_classification(bq_sql: str) -> Any | None:

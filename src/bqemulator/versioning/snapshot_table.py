@@ -12,6 +12,7 @@ tags the ``TableMeta`` with ``base_table`` and ``snapshot_time`` so
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from bqemulator.catalog.etag import generate_etag
@@ -19,10 +20,12 @@ from bqemulator.catalog.models import SnapshotMeta, TableMeta, TableSchema
 from bqemulator.domain.errors import (
     InvalidQueryError,
     ResourceRef,
+    UnsupportedFeatureError,
     resource_already_exists,
     resource_not_found,
 )
 from bqemulator.storage.sql_identifiers import quoted_table_ref, schema_name
+from bqemulator.versioning.ddl import table_metadata_options
 
 if TYPE_CHECKING:  # pragma: no cover
     from bqemulator.api.dependencies import AppContext
@@ -42,8 +45,28 @@ class SnapshotTableManager:
         source_project: str,
         source_dataset: str,
         source_table: str,
+        *,
+        replace: bool = False,
+        if_not_exists: bool = False,
+        system_time: str | None = None,
+        options: Mapping[str, object] | None = None,
     ) -> TableMeta:
-        """Materialise a ``SNAPSHOT`` table from the source."""
+        """Materialise a ``SNAPSHOT`` table from the source.
+
+        ``if_not_exists`` returns an existing table untouched and
+        ``replace`` drops an existing snapshot first (any other table type
+        under that name is still an "already exists" error, as in
+        BigQuery). ``options`` is the lower-cased ``OPTIONS(...)`` clause
+        (see :func:`table_metadata_options`). ``system_time`` (``FOR
+        SYSTEM_TIME AS OF``) is parsed but not yet served — the snapshot
+        is always of the current state — so it is refused rather than
+        silently ignored.
+        """
+        if system_time is not None:
+            raise UnsupportedFeatureError(
+                "CREATE SNAPSHOT TABLE ... FOR SYSTEM_TIME AS OF is not supported; "
+                "bqemulator snapshots the table's current state only.",
+            )
         src_meta = self._ctx.catalog.get_table(
             source_project,
             source_dataset,
@@ -54,17 +77,15 @@ class SnapshotTableManager:
                 ResourceRef("table", source_project, source_dataset, source_table),
             )
 
-        if (
-            self._ctx.catalog.get_table(
-                target_project,
-                target_dataset,
-                target_table,
-            )
-            is not None
-        ):
-            raise resource_already_exists(
-                ResourceRef("table", target_project, target_dataset, target_table),
-            )
+        existing = self._ctx.catalog.get_table(target_project, target_dataset, target_table)
+        if existing is not None:
+            if if_not_exists:
+                return existing
+            if not (replace and existing.table_type == "SNAPSHOT"):
+                raise resource_already_exists(
+                    ResourceRef("table", target_project, target_dataset, target_table),
+                )
+            await self.drop(target_project, target_dataset, target_table)
 
         if self._ctx.catalog.get_dataset(target_project, target_dataset) is None:
             raise resource_not_found(
@@ -75,6 +96,7 @@ class SnapshotTableManager:
         dst_ref = quoted_table_ref(target_project, target_dataset, target_table)
 
         now = self._ctx.clock.now()
+        table_options = table_metadata_options(options or {})
 
         async with self._ctx.engine.write_lock():
             self._ctx.engine.execute(
@@ -91,7 +113,9 @@ class SnapshotTableManager:
                 table_id=target_table,
                 table_type="SNAPSHOT",
                 schema=(src_meta.schema_ or TableSchema()),
-                labels={},
+                description=table_options.description,
+                friendly_name=table_options.friendly_name,
+                labels=table_options.labels,
                 time_partitioning=src_meta.time_partitioning,
                 range_partitioning=src_meta.range_partitioning,
                 clustering=src_meta.clustering,
@@ -135,13 +159,20 @@ class SnapshotTableManager:
         target_project: str,
         target_dataset: str,
         target_table: str,
+        *,
+        if_exists: bool = False,
     ) -> None:
-        """Remove a user snapshot table and its catalog row."""
+        """Remove a user snapshot table and its catalog row.
+
+        ``if_exists`` makes a missing table a no-op.
+        """
         existing = self._ctx.catalog.get_table(
             target_project,
             target_dataset,
             target_table,
         )
+        if existing is None and if_exists:
+            return
         if existing is None:
             raise resource_not_found(
                 ResourceRef("table", target_project, target_dataset, target_table),

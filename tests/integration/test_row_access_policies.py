@@ -570,3 +570,54 @@ async def test_create_rap_on_sql_created_schema_table(client: httpx.AsyncClient)
     r = await client.get("/bigquery/v2/projects/p/datasets/sqlds/tables")
     assert r.status_code == 200
     assert [t["tableReference"]["tableId"] for t in r.json().get("tables", [])] == ["events"]
+
+
+@pytest.mark.asyncio
+async def test_rap_ddl_full_grammar(client: httpx.AsyncClient) -> None:
+    """``OR REPLACE``, a ``)`` inside a grantee, a leading comment and ``DROP ALL`` all route.
+
+    The regex this replaced rejected each of them; the comment is what dbt
+    prefixes to every statement.
+    """
+    body = await _query(
+        client,
+        '/* {"app": "dbt"} */\nCREATE ROW ACCESS POLICY eu ON ds.orders '
+        "GRANT TO ('user:eu@example.com') FILTER USING (region = 'EU')",
+    )
+    assert body.get("errors") is None
+    assert body["statementType"] == "CREATE_ROW_ACCESS_POLICY"
+    # OR REPLACE swaps the predicate in place.
+    body = await _query(
+        client,
+        "CREATE OR REPLACE ROW ACCESS POLICY eu ON ds.orders "
+        "GRANT TO ('user:eu@example.com', 'group:odd)name@example.com') "
+        "FILTER USING (region = 'US')",
+    )
+    assert body.get("errors") is None
+    res = await _run(client, "SELECT id FROM ds.orders ORDER BY id", caller="user:eu@example.com")
+    assert [int(r["f"][0]["v"]) for r in res["rows"]] == [3, 4]
+    # IF NOT EXISTS on an existing policy is a no-op, not an error.
+    body = await _query(
+        client,
+        "CREATE ROW ACCESS POLICY IF NOT EXISTS eu ON ds.orders FILTER USING (region = 'EU')",
+    )
+    assert body.get("errors") is None
+    body = await _query(
+        client,
+        "CREATE ROW ACCESS POLICY us ON ds.orders "
+        "GRANT TO ('user:us@example.com') FILTER USING (region = 'US')",
+    )
+    assert body.get("errors") is None
+    r = await client.get("/bigquery/v2/projects/p/datasets/ds/tables/orders/rowAccessPolicies")
+    assert {p["rowAccessPolicyReference"]["policyId"] for p in r.json()["rowAccessPolicies"]} == {
+        "eu",
+        "us",
+    }
+    body = await _query(client, "DROP ALL ROW ACCESS POLICIES ON `p.ds.orders`;")
+    assert body.get("errors") is None
+    assert body["statementType"] == "DROP_ROW_ACCESS_POLICY"
+    r = await client.get("/bigquery/v2/projects/p/datasets/ds/tables/orders/rowAccessPolicies")
+    assert r.json().get("rowAccessPolicies", []) == []
+    # DROP ... IF EXISTS on a missing policy is a no-op.
+    body = await _query(client, "DROP ROW ACCESS POLICY IF EXISTS eu ON ds.orders")
+    assert body.get("errors") is None

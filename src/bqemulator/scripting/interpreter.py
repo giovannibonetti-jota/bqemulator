@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-import re
 from typing import TYPE_CHECKING, Any, ClassVar
 import uuid
 
@@ -71,6 +70,7 @@ from bqemulator.scripting.exceptions import (
 )
 from bqemulator.scripting.frames import FrameStack
 from bqemulator.scripting.parser import parse_script
+from bqemulator.sql.ddl_heads import parse_transaction_control
 from bqemulator.sql.inner_query import rewrite_and_translate_statement
 from bqemulator.sql.parameters import bind_parameters
 from bqemulator.sql.statement import parse_single_statement
@@ -647,7 +647,7 @@ class ScriptInterpreter:
         # ROLLBACK [TRANSACTION] and route through the emulator-side
         # snapshot machinery rather than DuckDB's native transactions.
         # See :meth:`__init__` for the rationale and ``self._active_txn``.
-        txn_op = _classify_txn_statement(sql)
+        txn_op = parse_transaction_control(sql)
         if txn_op is not None:
             await self._handle_txn_statement(txn_op)
             # Transaction-control statements have no result set; per the
@@ -1176,41 +1176,6 @@ def _is_top_level_projection(col: exp.Column) -> bool:
     placeholder in an alias and preserve the projected name.
     """
     return isinstance(col.parent, exp.Select) and col.arg_key == "expressions"
-
-
-#: Matches ``BEGIN`` / ``BEGIN TRANSACTION`` / ``START TRANSACTION``,
-#: ``COMMIT`` / ``COMMIT TRANSACTION`` / ``COMMIT WORK`` /
-#: ``END TRANSACTION``, ``ROLLBACK`` / ``ROLLBACK TRANSACTION`` /
-#: ``ROLLBACK WORK`` — with optional trailing semicolons and any
-#: amount of internal whitespace. Used to dispatch BigQuery
-#: transaction-control statements to the emulator-side snapshot
-#: machinery instead of forwarding them to DuckDB.
-_TXN_BEGIN_RE = re.compile(
-    r"^\s*(?:BEGIN(?:\s+TRANSACTION)?|START\s+TRANSACTION)\s*;?\s*$", re.IGNORECASE
-)
-_TXN_COMMIT_RE = re.compile(
-    r"^\s*(?:COMMIT(?:\s+(?:TRANSACTION|WORK))?|END\s+TRANSACTION)\s*;?\s*$", re.IGNORECASE
-)
-_TXN_ROLLBACK_RE = re.compile(r"^\s*ROLLBACK(?:\s+(?:TRANSACTION|WORK))?\s*;?\s*$", re.IGNORECASE)
-
-
-def _classify_txn_statement(bq_sql: str) -> str | None:
-    """Return ``"BEGIN"`` / ``"COMMIT"`` / ``"ROLLBACK"`` or ``None``.
-
-    Used by :meth:`ScriptInterpreter._exec_sql` to short-circuit
-    transaction-control SQL to the emulator-side snapshot machinery
-    rather than forwarding the statement to DuckDB. ``BEGIN`` alone is
-    classified as ``"BEGIN"`` only when the scripting parser routed it
-    here — the parser disambiguates ``BEGIN TRANSACTION`` from
-    ``BEGIN ... END`` blocks before reaching ``_exec_sql``.
-    """
-    if _TXN_BEGIN_RE.match(bq_sql):
-        return "BEGIN"
-    if _TXN_COMMIT_RE.match(bq_sql):
-        return "COMMIT"
-    if _TXN_ROLLBACK_RE.match(bq_sql):
-        return "ROLLBACK"
-    return None
 
 
 def _dml_targets(bq_sql: str, project_id: str, *, tree: exp.Expr | None = None) -> list[str]:
