@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
+import inspect
 import json
 from threading import RLock
 from typing import TYPE_CHECKING, Any
@@ -79,6 +80,17 @@ class JavaScriptUDFRuntime:
 
         def invoke(*args: Any) -> Any:
             return _invoke_routine(context, args)
+
+        # DuckDB counts the callable's parameters from its signature and
+        # refuses a mismatch with ``arg_types``; a ``*args`` wrapper counts
+        # as one, which only fits one-argument UDFs. Advertise the real
+        # arity instead.
+        invoke.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+            [
+                inspect.Parameter(f"arg{i}", inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for i in range(len(routine.arguments))
+            ],
+        )
 
         # DuckDB needs explicit parameter + return types.
         arg_types = [duckdb_conn.type(render_duckdb_type(a.data_type)) for a in routine.arguments]

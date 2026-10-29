@@ -572,7 +572,9 @@ class ScriptInterpreter:
             last_modified_time=now,
             etag=generate_etag(project_id, dataset_id, routine_id, str(now)),
         )
-        await _upsert_routine(self._ctx, routine, or_replace=stmt.or_replace)
+        await _upsert_routine(
+            self._ctx, routine, or_replace=stmt.or_replace, if_not_exists=stmt.if_not_exists
+        )
 
     async def _exec_create_temp_function(
         self,
@@ -633,7 +635,9 @@ class ScriptInterpreter:
             last_modified_time=now,
             etag=generate_etag(project_id, dataset_id, routine_id, str(now)),
         )
-        await _upsert_routine(self._ctx, routine, or_replace=stmt.or_replace)
+        await _upsert_routine(
+            self._ctx, routine, or_replace=stmt.or_replace, if_not_exists=stmt.if_not_exists
+        )
 
     async def _exec_sql(self, sql: str) -> None:
         sql = sql.strip()
@@ -1274,13 +1278,21 @@ async def _upsert_routine(
     routine: RoutineMeta,
     *,
     or_replace: bool,
+    if_not_exists: bool = False,
 ) -> None:
-    """Insert or replace a routine via the catalog + UDF registry."""
+    """Insert or replace a routine via the catalog + UDF registry.
+
+    ``if_not_exists`` makes an existing routine a no-op (BigQuery reports
+    the DDL operation as ``SKIP``); without it or ``or_replace`` the
+    conflict is an ``alreadyExists`` error.
+    """
     existing = ctx.catalog.get_routine(
         routine.project_id,
         routine.dataset_id,
         routine.routine_id,
     )
+    if existing is not None and if_not_exists:
+        return
     async with ctx.engine.write_lock():
         if existing is not None and not or_replace:
             from bqemulator.domain.errors import resource_already_exists
