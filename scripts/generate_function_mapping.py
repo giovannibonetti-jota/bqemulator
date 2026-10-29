@@ -112,6 +112,7 @@ _REWRITER_CATEGORY_DISPLAY: dict[str, str] = {
     "timestamp_iso_helpers": "Pre-translator (TIMESTAMP ISO helpers)",
     "unnest_offset": "Pre-translator (UNNEST WITH OFFSET)",
     "unnest_struct": "Pre-translator (UNNEST STRUCT aliases)",
+    "unnest_struct_columns": "Post-translator (UNNEST STRUCT columns)",
     "wildcard_expander": "Pre-translator (wildcard tables)",
 }
 

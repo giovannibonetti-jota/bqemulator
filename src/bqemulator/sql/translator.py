@@ -54,6 +54,9 @@ from bqemulator.sql.rewriter.timestamp_iso_helpers import (
     rewrite_timestamp_iso_helpers,
 )
 from bqemulator.sql.rewriter.unnest_struct import rewrite_unnest_struct
+from bqemulator.sql.rewriter.unnest_struct_columns import (
+    expose_unnest_struct_columns,
+)
 from bqemulator.sql.rules import TranslationRule, get_all_rules
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -427,10 +430,12 @@ class SQLTranslator:
         if schema is not None:
             tree, _qualified_ok = self._annotate_tree(tree, schema)
 
-        # ``expr.*`` select items need the type annotations above to
-        # name the struct's fields, and must be expanded before the
-        # rule walk so the per-field copies of ``expr`` get rewritten
-        # like any other subtree.
+        # ``FROM UNNEST(<array of STRUCT>)`` and ``expr.*`` need the
+        # type annotations above to name the struct's fields, and run
+        # before the rule walk so the subtrees they copy get rewritten
+        # like any other.
+        if expose_unnest_struct_columns(tree):
+            modified = True
         if expand_struct_star(tree):
             modified = True
 
