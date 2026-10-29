@@ -749,3 +749,9 @@ also_copy = ["src/bqemulator/", "scripts/"]
 # value of pre-filtering uncovered lines is small relative to the
 # Python-3.14 compatibility hazard.
 mutate_only_covered_lines = false
+
+[tool.uv]
+# Rebuild when the sources change, not only the metadata: the package is
+# installed from a checkout (e.g. vendored by path) more often than from a
+# release, and uv's default keys miss edits under src/.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
