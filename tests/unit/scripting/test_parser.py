@@ -460,3 +460,20 @@ class TestPassthroughSql:
     def test_multiple_statements(self) -> None:
         script = parse_script("SELECT 1; SELECT 2; SELECT 3;")
         assert len(script.statements) == 3
+
+
+class TestCreateFunctionDeterminism:
+    @pytest.mark.parametrize("hint", ["DETERMINISTIC", "NOT DETERMINISTIC"])
+    def test_volatility_hint_is_accepted(self, hint: str) -> None:
+        """dbt-bigquery emits ``[NOT] DETERMINISTIC`` before ``LANGUAGE js`` for JS UDFs."""
+        stmt = parse_script(
+            f"CREATE OR REPLACE FUNCTION ds.f(a STRING) RETURNS STRING {hint} LANGUAGE js "
+            "AS '''return a;'''"
+        ).statements[0]
+        assert isinstance(stmt, CreateFunctionStmt)
+        assert stmt.language == "JAVASCRIPT"
+        assert stmt.body == "return a;"
+
+    def test_not_without_deterministic_is_rejected(self) -> None:
+        with pytest.raises(InvalidQueryError, match="DETERMINISTIC"):
+            parse_script("CREATE FUNCTION ds.f(a STRING) RETURNS STRING NOT LANGUAGE js AS 'x'")

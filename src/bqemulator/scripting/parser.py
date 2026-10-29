@@ -536,6 +536,18 @@ class Parser:
             f"CREATE {'TEMP ' if is_temp else ''}... expected FUNCTION or PROCEDURE",
         )
 
+    def _is_word(self, word: str) -> bool:
+        """True when the current token is ``word``, as a keyword or an identifier."""
+        tok = self._cursor.current
+        return tok.kind in ("KEYWORD", "IDENT") and tok.value.upper() == word
+
+    def _expect_word(self, word: str) -> None:
+        """Consume ``word`` whether the lexer classed it as a keyword or an identifier."""
+        if not self._is_word(word):
+            tok = self._cursor.current
+            raise InvalidQueryError(f"Expected {word!r}, got {tok.kind}:{tok.value!r}")
+        self._cursor.advance()
+
     def _parse_function_rest(self, *, or_replace: bool, table_fn: bool) -> CreateFunctionStmt:
         name = self._read_dotted_name()
         args = self._parse_routine_arg_list(for_procedure=False)
@@ -543,6 +555,14 @@ class Parser:
         if self._cursor.match_keyword("RETURNS"):
             self._cursor.advance()
             return_type = parse_bq_type_string(self._read_type_name())
+
+        # ``[NOT] DETERMINISTIC`` (BigQuery's volatility hint, emitted by
+        # dbt for JavaScript UDFs) is accepted and ignored.
+        if self._is_word("NOT"):
+            self._cursor.advance()
+            self._expect_word("DETERMINISTIC")
+        elif self._is_word("DETERMINISTIC"):
+            self._cursor.advance()
 
         language = "SQL"
         body = ""
