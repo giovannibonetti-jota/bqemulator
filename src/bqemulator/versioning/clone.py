@@ -26,6 +26,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from bqemulator.api.dependencies import AppContext
 
 
+#: Table types ``CREATE OR REPLACE TABLE … CLONE`` may overwrite.
+_REPLACEABLE_TABLE_TYPES = frozenset({"TABLE", "CLONE"})
+
+
 class CloneManager:
     """Handles ``CREATE TABLE ... CLONE`` DDL."""
 
@@ -40,8 +44,17 @@ class CloneManager:
         source_project: str,
         source_dataset: str,
         source_table: str,
+        *,
+        replace: bool = False,
+        if_not_exists: bool = False,
     ) -> TableMeta:
-        """Materialise a clone and register it in the catalog."""
+        """Materialise a clone and register it in the catalog.
+
+        ``if_not_exists`` returns the existing table untouched;
+        ``replace`` drops an existing plain table or clone first (as in
+        BigQuery, a snapshot or materialized view in the way is still an
+        "already exists" error).
+        """
         src_meta = self._ctx.catalog.get_table(
             source_project,
             source_dataset,
@@ -58,9 +71,12 @@ class CloneManager:
             target_table,
         )
         if dst_meta is not None:
-            raise resource_already_exists(
-                ResourceRef("table", target_project, target_dataset, target_table),
-            )
+            if if_not_exists:
+                return dst_meta
+            if not (replace and dst_meta.table_type in _REPLACEABLE_TABLE_TYPES):
+                raise resource_already_exists(
+                    ResourceRef("table", target_project, target_dataset, target_table),
+                )
 
         # Ensure the destination dataset exists; clones land inside the
         # dataset's regular schema just like normal tables.
@@ -75,6 +91,14 @@ class CloneManager:
         now = self._ctx.clock.now()
 
         async with self._ctx.engine.write_lock():
+            if dst_meta is not None:
+                self._ctx.engine.execute(f"DROP TABLE IF EXISTS {dst_ref}")
+                self._ctx.catalog.delete_table(
+                    target_project,
+                    target_dataset,
+                    target_table,
+                    not_found_ok=True,
+                )
             self._ctx.engine.execute(
                 f"CREATE TABLE {dst_ref} AS SELECT * FROM {src_ref}",
             )

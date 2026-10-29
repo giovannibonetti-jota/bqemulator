@@ -58,16 +58,18 @@ from bqemulator.scripting.interpreter import ScriptInterpreter
 from bqemulator.scripting.parser import parse_script
 from bqemulator.sql.inner_query import rewrite_and_translate_statement
 from bqemulator.sql.parameters import bind_parameters
+from bqemulator.sql.statement import parse_single_statement
 from bqemulator.sql.table_rewriter import rewrite_table_refs
 from bqemulator.sql.translator import SQLTranslator
 from bqemulator.storage.sql_identifiers import quoted_table_ref
 from bqemulator.versioning.ddl import (
     VersioningDDLRouter,
     execute_versioning_ddl,
-    is_versioning_ddl,
 )
 
 if TYPE_CHECKING:
+    from sqlglot import exp
+
     from bqemulator.api.dependencies import AppContext
 
 _log = get_logger(__name__)
@@ -360,12 +362,14 @@ async def execute_query_job(
     )
     script_statement_count = len(script.statements)
 
-    # Classify the statement type up front so the response populates
-    # ``statistics.query.statementType`` consistently across the
-    # versioning-DDL fast path, the scripting path, and the legacy
-    # single-SQL path. Best-effort: unparseable input returns ``""``
-    # and the field is omitted.
-    statement_type = "SCRIPT" if is_scripted else classify_statement_type(bq_sql)
+    # Parse a single statement once and classify it up front so the
+    # response populates ``statistics.query.statementType`` consistently
+    # across the versioning-DDL fast path, the scripting path, and the
+    # legacy single-SQL path; the interception and fast-path routers
+    # below dispatch on the same tree. Best-effort: unparseable input
+    # returns ``""`` and the field is omitted.
+    tree = None if is_scripted else parse_single_statement(bq_sql)
+    statement_type = "SCRIPT" if is_scripted else classify_statement_type(bq_sql, tree=tree)
     ddl_operation: str | None = None
 
     if is_scripted:
@@ -385,6 +389,7 @@ async def execute_query_job(
             project_id=project_id,
             job_id=job_id,
             bq_sql=bq_sql,
+            tree=tree,
             query_params=query_params,
             now=now,
             ctx=ctx,
@@ -396,6 +401,7 @@ async def execute_query_job(
             project_id=project_id,
             job_id=job_id,
             bq_sql=bq_sql,
+            tree=tree,
             statement_type=statement_type,
             now=now,
             ctx=ctx,
@@ -405,7 +411,7 @@ async def execute_query_job(
 
     # Refuse DML against immutable table types (SNAPSHOT,
     # MATERIALIZED_VIEW). BigQuery treats these as read-only.
-    _reject_dml_on_immutable(project_id, bq_sql, ctx)
+    _reject_dml_on_immutable(project_id, bq_sql, ctx, tree=tree)
 
     # Single-statement pre-execution guard + ``ddlOperationPerformed``
     # resolution (the scripted routine case was already resolved above).
@@ -427,7 +433,7 @@ async def execute_query_job(
 
     # Capture snapshots for tables modified by this statement, and
     # propagate TableDataChanged so dependent MVs flip stale.
-    await _capture_dml_snapshots(project_id, bq_sql, ctx)
+    await _capture_dml_snapshots(project_id, bq_sql, ctx, tree=tree)
 
     arrow_table, num_dml_affected_rows, ddl_schema_fields = _finalize_statement_result(
         arrow_table,
@@ -476,6 +482,7 @@ async def _run_statement_interception(
     project_id: str,
     job_id: str,
     bq_sql: str,
+    tree: exp.Expr | None,
     query_params: list[dict[str, Any]] | None,
     now: Any,
     ctx: AppContext,
@@ -486,14 +493,16 @@ async def _run_statement_interception(
     ``EXPORT DATA`` and ``CREATE MODEL`` are handled before the normal
     SELECT/DML/DDL flow: each runs its inner query through the standard
     pipeline and performs its own side effect (writing files, registering a
-    model). Returns the closing :class:`JobMeta`, or ``None`` when
-    ``statement_type`` is not an intercepted statement.
+    model). ``tree`` is the statement's parse (the same one
+    ``statement_type`` came from). Returns the closing :class:`JobMeta`,
+    or ``None`` when ``statement_type`` is not an intercepted statement.
     """
     if statement_type == "EXPORT_DATA":
         return await _execute_export_data_job(
             project_id=project_id,
             job_id=job_id,
             bq_sql=bq_sql,
+            tree=tree,
             query_params=query_params,
             now=now,
             ctx=ctx,
@@ -504,6 +513,7 @@ async def _run_statement_interception(
             project_id=project_id,
             job_id=job_id,
             bq_sql=bq_sql,
+            tree=tree,
             query_params=query_params,
             now=now,
             ctx=ctx,
@@ -556,6 +566,7 @@ async def _run_query_fast_paths(
     project_id: str,
     job_id: str,
     bq_sql: str,
+    tree: exp.Expr | None,
     statement_type: str,
     now: Any,
     ctx: AppContext,
@@ -564,9 +575,9 @@ async def _run_query_fast_paths(
 
     Only applies to single-statement input — multi-statement scripts
     dispatch these per-statement inside :class:`ScriptInterpreter`
-    (ADR 0023 §1.F) so the matching regexes don't greedy-match across
-    statement boundaries. Returns ``None`` when ``bq_sql`` is neither a
-    RAP DDL, a versioning DDL, nor a routine drop.
+    (ADR 0023 §1.F). ``tree`` is the statement's parse, ``None`` when
+    SQLGlot could not parse it. Returns ``None`` when ``bq_sql`` is
+    neither a RAP DDL, a versioning DDL, nor a routine drop.
     """
     routine_drop = await _maybe_run_routine_drop(
         project_id=project_id,
@@ -592,7 +603,7 @@ async def _run_query_fast_paths(
             now=now,
             ctx=ctx,
         )
-    ddl_result = await _maybe_run_versioning_ddl(project_id, bq_sql, ctx)
+    ddl_result = await _maybe_run_versioning_ddl(project_id, bq_sql, ctx, tree=tree)
     if ddl_result is not None:
         return _build_ddl_job_meta(
             project_id=project_id,
@@ -1712,7 +1723,6 @@ _KNOWN_EXPORT_OPTIONS: frozenset[str] = frozenset(
 #: BigQuery's option/format validation.
 _CSV_ONLY_OPTIONS: frozenset[str] = frozenset({"header", "field_delimiter"})
 
-_EXPORT_DATA_RE = re.compile(r"^\s*EXPORT\s+DATA\b", re.IGNORECASE)
 
 _AVRO_EXTENSION_MSG = (
     "Writing AVRO requires DuckDB's ``avro`` extension. Re-enable "
@@ -2048,25 +2058,22 @@ def _extract_export_options(properties: Any) -> _ExportOptions:
     )
 
 
-def parse_export_data(bq_sql: str) -> _ExportRequest | None:
+def parse_export_data(bq_sql: str, tree: exp.Expr | None = None) -> _ExportRequest | None:
     """Parse ``bq_sql`` as an ``EXPORT DATA`` statement, or return ``None``.
 
-    Returns ``None`` for any statement that is not ``EXPORT DATA`` (a cheap
-    regex gate runs before the full SQLGlot parse). Raises
-    :class:`UnsupportedFeatureError` for ``EXPORT DATA WITH CONNECTION``
-    (external sinks are out of scope) and :class:`InvalidQueryError` for a
-    malformed statement or invalid OPTIONS.
+    Dispatches on SQLGlot's :class:`exp.Export` node (``tree`` when the
+    caller already parsed the statement, else parsed here), so leading
+    comments such as dbt's job tags are no obstacle. Returns ``None`` for
+    any other statement and for unparseable input (the normal path reports
+    it). Raises :class:`UnsupportedFeatureError` for ``EXPORT DATA WITH
+    CONNECTION`` (external sinks are out of scope) and
+    :class:`InvalidQueryError` for a malformed statement or invalid OPTIONS.
     """
-    if not _EXPORT_DATA_RE.match(bq_sql):
-        return None
-    import sqlglot
     from sqlglot import exp
 
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 — non-EXPORT or unparseable: defer to the normal path
-        return None
-    if not isinstance(tree, exp.Export):  # pragma: no cover — regex gate already matched
+    if tree is None:
+        tree = parse_single_statement(bq_sql)
+    if not isinstance(tree, exp.Export):
         return None
     if tree.args.get("connection"):
         raise UnsupportedFeatureError(
@@ -2189,6 +2196,7 @@ async def _execute_export_data_job(
     now: Any,
     ctx: AppContext,
     caller: CallerIdentity | None,
+    tree: exp.Expr | None = None,
 ) -> JobMeta:
     """Run an ``EXPORT DATA`` statement as a QUERY job and write its result.
 
@@ -2198,7 +2206,7 @@ async def _execute_export_data_job(
     is written to Cloud Storage. The job reports ``statementType =
     EXPORT_DATA`` with zero result rows.
     """
-    request = parse_export_data(bq_sql)
+    request = parse_export_data(bq_sql, tree=tree)
     if request is None:  # pragma: no cover — classifier already guaranteed EXPORT_DATA
         raise InvalidQueryError("Malformed EXPORT DATA statement.")
     effective_caller = caller or CallerIdentity(
@@ -2245,42 +2253,8 @@ async def _execute_export_data_job(
 # CREATE MODEL: surface-only model registration (ADR 0047 / RFC 0002)
 # ---------------------------------------------------------------------------
 
-# Admits the ``TEMP`` / ``TEMPORARY`` modifier SQLGlot accepts so the gate
-# agrees with the classifier; temporary models are then rejected explicitly in
-# ``_parse_model_options`` (BigQuery ML has no temporary models) rather than
-# falling through to a misleading "Malformed" error.
-_CREATE_MODEL_RE = re.compile(
-    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?MODEL\b",
-    re.IGNORECASE,
-)
-
 #: Maximum dotted parts in a model reference (``project.dataset.model``).
 _MAX_MODEL_REF_PARTS = 3
-
-
-def _strip_leading_sql_comments(sql: str) -> str:
-    """Return ``sql`` with leading whitespace and ``--`` / ``/* */`` comments removed.
-
-    A linear hand-rolled scan (not a regex) so it cannot trip CodeQL's ReDoS
-    detector, mirroring the scanner in
-    :mod:`bqemulator.sql.rewriter.alter_table_set_options`. Lets the CREATE MODEL
-    regex gate match statements a tool prefixes with comments (e.g. dbt's
-    ``/* {...} */`` job tags), which SQLGlot (and therefore the statement
-    classifier) already sees through.
-    """
-    i, n = 0, len(sql)
-    while i < n:
-        if sql[i].isspace():
-            i += 1
-        elif sql.startswith("--", i):
-            nl = sql.find("\n", i + 2)
-            i = n if nl == -1 else nl + 1
-        elif sql.startswith("/*", i):
-            end = sql.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-        else:
-            break
-    return sql[i:]
 
 
 #: Documented ``CREATE MODEL`` OPTIONS names (lower-cased). Surface-only
@@ -2463,26 +2437,25 @@ def training_schema_sql(select_sql: str) -> str:
     return f"SELECT * FROM ({select_sql}) AS _bqml_train LIMIT 0"
 
 
-def parse_create_model(bq_sql: str) -> _CreateModelRequest | None:
+def parse_create_model(bq_sql: str, tree: exp.Expr | None = None) -> _CreateModelRequest | None:
     """Parse ``bq_sql`` as a ``CREATE MODEL`` statement, or return ``None``.
 
-    Returns ``None`` for any statement that is not ``CREATE MODEL`` (a cheap
-    regex gate precedes the full SQLGlot parse). Raises
-    :class:`InvalidQueryError` for a malformed target or OPTIONS and
-    :class:`UnsupportedFeatureError` for the out-of-scope ``TRANSFORM()``
-    clause.
+    Dispatches on SQLGlot's ``exp.Create`` with ``kind=MODEL`` (``tree``
+    when the caller already parsed the statement, else parsed here), which
+    is how the statement classifier recognises it too, so the two always
+    agree — including through leading comments and the ``TEMP`` modifier
+    (rejected explicitly in ``_parse_model_options``, since BigQuery ML has
+    no temporary models). Returns ``None`` for any other statement and for
+    unparseable input. Raises :class:`InvalidQueryError` for a malformed
+    target or OPTIONS and :class:`UnsupportedFeatureError` for the
+    out-of-scope ``TRANSFORM()`` clause.
     """
-    if not _CREATE_MODEL_RE.match(_strip_leading_sql_comments(bq_sql)):
-        return None
-    import sqlglot
     from sqlglot import exp
 
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 (unparseable: defer to the normal path)
-        return None
+    if tree is None:
+        tree = parse_single_statement(bq_sql)
     if not isinstance(tree, exp.Create) or (tree.args.get("kind") or "").upper() != "MODEL":
-        return None  # pragma: no cover (regex gate already matched a CREATE MODEL)
+        return None
     project_id, dataset_id, model_id = _model_target(tree.this)
     inner = tree.args.get("expression")
     if not isinstance(inner, exp.Query):
@@ -2639,6 +2612,7 @@ async def _execute_create_model_job(
     now: Any,
     ctx: AppContext,
     caller: CallerIdentity | None,
+    tree: exp.Expr | None = None,
 ) -> JobMeta:
     """Run a ``CREATE MODEL`` statement as a QUERY job: register metadata, no training.
 
@@ -2649,7 +2623,7 @@ async def _execute_create_model_job(
     CREATE_MODEL`` with zero result rows. ``IF NOT EXISTS`` on an existing
     model skips both the query and the write.
     """
-    request = parse_create_model(bq_sql)
+    request = parse_create_model(bq_sql, tree=tree)
     if request is None:  # pragma: no cover (classifier already guaranteed CREATE_MODEL)
         raise InvalidQueryError("Malformed CREATE MODEL statement.")
     operation = preflight_create_model(request, project_id, ctx)
@@ -2709,12 +2683,16 @@ async def _maybe_run_versioning_ddl(
     project_id: str,
     bq_sql: str,
     ctx: AppContext,
+    *,
+    tree: exp.Expr | None,
 ) -> pa.Table | None:
-    """Detect + execute a Phase-7 DDL; return an empty pa.Table on hit."""
-    if not is_versioning_ddl(bq_sql):
-        return None
-    router = VersioningDDLRouter(project_id)
-    parsed = router.parse(bq_sql)
+    """Detect + execute a Phase-7 DDL; return an empty pa.Table on hit.
+
+    ``tree`` is the caller's single parse of ``bq_sql`` (``None`` when
+    SQLGlot rejected it; the router then only knows the ``REFRESH
+    MATERIALIZED VIEW`` extension).
+    """
+    parsed = VersioningDDLRouter(project_id).parse(bq_sql, tree=tree)
     if parsed is None:
         return None
     await execute_versioning_ddl(parsed, ctx)
@@ -2861,20 +2839,20 @@ def _reject_dml_on_immutable(
     project_id: str,
     bq_sql: str,
     ctx: AppContext,
+    *,
+    tree: exp.Expr | None = None,
 ) -> None:
     """Refuse DML targeting a SNAPSHOT or MATERIALIZED_VIEW table.
 
     BigQuery rejects writes to those table types — the emulator must
     surface the same error so user code that relies on the immutability
-    invariant doesn't silently corrupt data.
+    invariant doesn't silently corrupt data. ``tree`` is the caller's
+    parse of a single statement; without one (scripts) the first
+    statement is parsed here.
     """
-    import sqlglot
-
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 — non-DML or unparseable; nothing to do
-        return
-    if not _is_dml(tree):
+    if tree is None:
+        tree = _parse_for_classification(bq_sql)
+    if tree is None or not _is_dml(tree):
         return
     for proj, dataset, table in _dml_target_tables(tree, project_id):
         meta = ctx.catalog.get_table(proj, dataset, table)
@@ -2891,21 +2869,20 @@ async def _capture_dml_snapshots(
     project_id: str,
     bq_sql: str,
     ctx: AppContext,
+    *,
+    tree: exp.Expr | None = None,
 ) -> None:
     """Snapshot every table modified by ``bq_sql`` (POST-change).
 
     The snapshot manager publishes ``TableDataChanged`` as a side effect,
     which in turn marks dependent MVs stale. Capture is serialised
     through the write lock so concurrent writers don't interleave a
-    half-applied snapshot with a new DML.
+    half-applied snapshot with a new DML. ``tree`` as in
+    :func:`_reject_dml_on_immutable`.
     """
-    import sqlglot
-
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 — non-DML or unparseable; nothing to do
-        return
-    if not _is_dml(tree):
+    if tree is None:
+        tree = _parse_for_classification(bq_sql)
+    if tree is None or not _is_dml(tree):
         return
 
     targets = _dml_target_tables(tree, project_id)
@@ -3033,11 +3010,12 @@ def _classify_drop(tree: Any) -> str:
     return _DROP_KIND_TO_STATEMENT_TYPE.get((tree.args.get("kind") or "").upper(), "")
 
 
-def classify_statement_type(bq_sql: str) -> str:
+def classify_statement_type(bq_sql: str, tree: exp.Expr | None = None) -> str:
     """Return BigQuery's ``statementType`` for ``bq_sql``.
 
     Used by the executor to populate ``statistics.query.statementType``
-    on every job's response.
+    on every job's response. ``tree`` is the statement's parse when the
+    caller already has it; otherwise the (first) statement is parsed here.
 
     Returns one of: ``SELECT``, ``INSERT``, ``UPDATE``, ``DELETE``,
     ``MERGE``, ``CREATE_TABLE``, ``CREATE_TABLE_AS_SELECT``,
@@ -3056,7 +3034,8 @@ def classify_statement_type(bq_sql: str) -> str:
     rap_type = _classify_rap_ddl(bq_sql)
     if rap_type:
         return rap_type
-    tree = _parse_for_classification(bq_sql)
+    if tree is None:
+        tree = _parse_for_classification(bq_sql)
     if tree is None:
         return ""
     return _classify_parsed_tree(tree)

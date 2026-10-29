@@ -179,3 +179,80 @@ def test_parse_leaves_plain_views_and_tables_alone() -> None:
     router = VersioningDDLRouter("p")
     assert router.parse("CREATE VIEW ds.v AS SELECT 1") is None
     assert router.parse("CREATE TABLE ds.t AS SELECT 1") is None
+
+
+# --- SQLGlot-typed heads --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "replace", "if_not_exists"),
+    [
+        ("CREATE TABLE ds.copy CLONE ds.t", False, False),
+        ("CREATE OR REPLACE TABLE ds.copy CLONE ds.t", True, False),
+        ("CREATE TABLE IF NOT EXISTS ds.copy CLONE ds.t;", False, True),
+        ('/* {"app": "dbt"} */\ncreate table ds.copy clone ds.t', False, False),
+    ],
+)
+def test_parse_create_clone_forms(sql: str, replace: bool, if_not_exists: bool) -> None:
+    """Every ``CREATE TABLE … CLONE`` form SQLGlot types routes to the clone manager."""
+    parsed = VersioningDDLRouter("p").parse(sql)
+    assert parsed is not None
+    assert parsed.kind is VersioningDDLKind.CREATE_CLONE
+    assert (parsed.target_table, parsed.source_table) == ("copy", "t")
+    assert (parsed.replace, parsed.if_not_exists) == (replace, if_not_exists)
+
+
+def test_parse_create_clone_whole_backticked_hyphenated_project() -> None:
+    parsed = VersioningDDLRouter("p").parse("CREATE TABLE `p-1.ds.copy` CLONE `p-1`.`ds`.`t`")
+    assert parsed is not None
+    assert (parsed.target_project, parsed.source_project) == ("p-1", "p-1")
+
+
+def test_parse_create_table_copy_is_not_a_clone() -> None:
+    """``CREATE TABLE … COPY`` is a plain copy, not a clone (and not versioning DDL)."""
+    assert VersioningDDLRouter("p").parse("CREATE TABLE ds.copy COPY ds.t") is None
+
+
+@pytest.mark.parametrize(
+    ("sql", "if_exists"),
+    [
+        ("DROP MATERIALIZED VIEW ds.daily", False),
+        ("DROP MATERIALIZED VIEW IF EXISTS `p.ds.daily`;", True),
+        ("-- made by a tool\nDROP MATERIALIZED VIEW IF EXISTS ds.daily", True),
+    ],
+)
+def test_parse_drop_materialized_view_forms(sql: str, if_exists: bool) -> None:
+    parsed = VersioningDDLRouter("p").parse(sql)
+    assert parsed is not None
+    assert parsed.kind is VersioningDDLKind.DROP_MATERIALIZED_VIEW
+    assert parsed.target_table == "daily"
+    assert parsed.if_exists is if_exists
+
+
+def test_parse_drop_plain_view_is_not_versioning_ddl() -> None:
+    assert VersioningDDLRouter("p").parse("DROP VIEW IF EXISTS ds.v") is None
+
+
+def test_parse_rejects_multi_statement_input() -> None:
+    """A second statement after the DDL must not be swallowed into the view body."""
+    router = VersioningDDLRouter("p")
+    assert router.parse("CREATE MATERIALIZED VIEW ds.mv AS SELECT 1 AS x; SELECT 2") is None
+    assert router.parse("CREATE TABLE ds.copy CLONE ds.t; SELECT 2") is None
+
+
+def test_parse_accepts_a_pre_parsed_tree() -> None:
+    """The executor parses once and hands the tree down; the result is identical."""
+    from bqemulator.sql.statement import parse_single_statement
+
+    sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS ds.mv OPTIONS(description='d') AS SELECT 1 AS x"
+    router = VersioningDDLRouter("p")
+    tree = parse_single_statement(sql)
+    assert router.parse(sql, tree=tree) == router.parse(sql)
+
+
+def test_parse_refresh_extension_survives_without_a_tree() -> None:
+    """SQLGlot rejects the emulator-only REFRESH form; it is matched on the text."""
+    parsed = VersioningDDLRouter("p").parse("REFRESH MATERIALIZED VIEW `p.ds.daily`;", tree=None)
+    assert parsed is not None
+    assert parsed.kind is VersioningDDLKind.REFRESH_MATERIALIZED_VIEW
+    assert parsed.target_table == "daily"
