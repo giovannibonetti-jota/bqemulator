@@ -11,16 +11,19 @@ touch the source.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from bqemulator.catalog.etag import generate_etag
 from bqemulator.catalog.models import TableMeta, TableSchema
 from bqemulator.domain.errors import (
     ResourceRef,
+    UnsupportedFeatureError,
     resource_already_exists,
     resource_not_found,
 )
 from bqemulator.storage.sql_identifiers import quoted_table_ref
+from bqemulator.versioning.ddl import table_metadata_options
 
 if TYPE_CHECKING:  # pragma: no cover
     from bqemulator.api.dependencies import AppContext
@@ -47,14 +50,25 @@ class CloneManager:
         *,
         replace: bool = False,
         if_not_exists: bool = False,
+        system_time: str | None = None,
+        options: Mapping[str, object] | None = None,
     ) -> TableMeta:
         """Materialise a clone and register it in the catalog.
 
         ``if_not_exists`` returns the existing table untouched;
         ``replace`` drops an existing plain table or clone first (as in
         BigQuery, a snapshot or materialized view in the way is still an
-        "already exists" error).
+        "already exists" error). ``options`` is the lower-cased
+        ``OPTIONS(...)`` clause (see :func:`table_metadata_options`).
+        ``system_time`` (``FOR SYSTEM_TIME AS OF``) is parsed but not yet
+        served: the clone always copies the current state, so it is
+        refused rather than silently ignored.
         """
+        if system_time is not None:
+            raise UnsupportedFeatureError(
+                "CREATE TABLE ... CLONE ... FOR SYSTEM_TIME AS OF is not supported; "
+                "bqemulator clones the table's current state only.",
+            )
         src_meta = self._ctx.catalog.get_table(
             source_project,
             source_dataset,
@@ -89,6 +103,7 @@ class CloneManager:
         dst_ref = quoted_table_ref(target_project, target_dataset, target_table)
 
         now = self._ctx.clock.now()
+        table_options = table_metadata_options(options or {})
 
         async with self._ctx.engine.write_lock():
             if dst_meta is not None:
@@ -114,7 +129,9 @@ class CloneManager:
                 table_id=target_table,
                 table_type="CLONE",
                 schema=(src_meta.schema_ or TableSchema()),
-                labels={},
+                description=table_options.description,
+                friendly_name=table_options.friendly_name,
+                labels=table_options.labels,
                 time_partitioning=src_meta.time_partitioning,
                 range_partitioning=src_meta.range_partitioning,
                 clustering=src_meta.clustering,

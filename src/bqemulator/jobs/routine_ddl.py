@@ -30,28 +30,19 @@ registry rather than being handed to DuckDB (which raises
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import TYPE_CHECKING, Any
 
-import sqlglot
 from sqlglot import exp
 
 from bqemulator.scripting.ast import CreateFunctionStmt
+from bqemulator.sql.ddl_heads import DropTableFunction, parse_ddl_head
+from bqemulator.sql.statement import parse_single_statement
 
 if TYPE_CHECKING:  # pragma: no cover
     from bqemulator.api.dependencies import AppContext
 
 _REF_FULLY_QUALIFIED = 3
 _REF_DATASET_QUALIFIED = 2
-
-#: ``DROP TABLE FUNCTION`` is not in sqlglot's BigQuery grammar (it
-#: raises a ParseError), so it is detected here. These two matchers
-#: anchor only the fixed keyword prefixes — each ``\s+`` is followed by
-#: a literal, never by a capture group — so they run in linear time; the
-#: routine name is parsed from the remainder with plain string ops
-#: rather than a backtracking-prone whole-statement pattern.
-_DROP_TABLE_FUNCTION_PREFIX_RE = re.compile(r"^\s*DROP\s+TABLE\s+FUNCTION\s+", re.IGNORECASE)
-_IF_EXISTS_PREFIX_RE = re.compile(r"^IF\s+EXISTS\s+", re.IGNORECASE)
 
 #: SQLGlot ``Drop`` ``kind`` → BigQuery ``statementType`` for routine drops.
 _DROP_KIND_TO_STATEMENT_TYPE = {
@@ -105,31 +96,31 @@ class DropRoutineRef:
     if_exists: bool
 
 
-def detect_drop_routine(bq_sql: str, default_project: str) -> DropRoutineRef | None:
+def detect_drop_routine(
+    bq_sql: str,
+    default_project: str,
+    *,
+    tree: exp.Expr | None = None,
+) -> DropRoutineRef | None:
     """Return a :class:`DropRoutineRef` for a single routine drop, else ``None``.
 
-    ``DROP TABLE FUNCTION`` is matched by regex (sqlglot cannot parse
-    it); ``DROP FUNCTION`` / ``DROP PROCEDURE`` are matched via the
-    sqlglot AST. Returns ``None`` for every non-routine DROP (table,
-    view, schema, …) so the caller falls through to the normal path.
+    ``DROP FUNCTION`` / ``DROP PROCEDURE`` dispatch on the sqlglot AST
+    (``tree`` when the caller already parsed the statement). ``DROP TABLE
+    FUNCTION`` is not in sqlglot's BigQuery grammar — it raises a
+    ParseError — so a statement with no tree goes through the DDL-head
+    grammar. Returns ``None`` for every non-routine DROP (table, view,
+    schema, …) so the caller falls through to the normal path.
     """
-    table_fn = _DROP_TABLE_FUNCTION_PREFIX_RE.match(bq_sql)
-    if table_fn is not None:
-        remainder = bq_sql[table_fn.end() :]
-        if_exists_match = _IF_EXISTS_PREFIX_RE.match(remainder)
-        if if_exists_match is not None:
-            remainder = remainder[if_exists_match.end() :]
-        # Strip a trailing ``;`` and surrounding whitespace from the name.
-        name = remainder.strip().rstrip(";").strip()
-        ref = _ref_from_name(name, default_project)
+    if tree is None:
+        tree = parse_single_statement(bq_sql)
+    if tree is None:
+        head = parse_ddl_head(bq_sql)
+        if not isinstance(head, DropTableFunction):
+            return None
+        ref = _ref_from_name(head.name, default_project)
         if ref is None:
             return None
-        return DropRoutineRef("DROP_TABLE_FUNCTION", *ref, if_exists_match is not None)
-
-    try:
-        tree = sqlglot.parse_one(bq_sql, read="bigquery")
-    except Exception:  # noqa: BLE001 — not a routine drop / unparseable
-        return None
+        return DropRoutineRef("DROP_TABLE_FUNCTION", *ref, head.if_exists)
     if not isinstance(tree, exp.Drop):
         return None
     statement_type = _DROP_KIND_TO_STATEMENT_TYPE.get((tree.args.get("kind") or "").upper())

@@ -156,6 +156,10 @@ dependencies = [
     # ``[avro]`` optional extra to the runtime tree closes the
     # "default-Java-client silently broken" failure mode.
     "fastavro>=1.9",
+    # Parser combinators for the DDL heads SQLGlot leaves untyped (snapshots,
+    # row access policies, DROP TABLE FUNCTION, transaction control); see
+    # ``sql/ddl_heads.py`` and ADR 0049. Pure Python, no dependencies.
+    "parsy>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -415,6 +419,7 @@ exclude = [
 module = [
     "duckdb.*",
     "sqlglot.*",
+    "parsy.*",
     "google.protobuf.*",
     "google.rpc.*",
     "grpc.*",
@@ -453,6 +458,8 @@ module = [
     "bqemulator.udf.*",
     "bqemulator.scripting.*",
     "bqemulator.sql.rewriter.*",
+    # parsy ships no type information; the grammar module composes its parsers.
+    "bqemulator.sql.ddl_heads",
 ]
 disable_error_code = ["misc", "no-any-return", "arg-type", "return"]
 warn_return_any = false

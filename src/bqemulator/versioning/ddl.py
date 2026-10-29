@@ -13,15 +13,16 @@ TABLE ... CLONE`` and ``DROP MATERIALIZED VIEW`` parse into typed
 :class:`exp.Create` / :class:`exp.Drop` nodes that carry ``OR REPLACE``,
 ``IF [NOT] EXISTS``, ``PARTITION BY``, ``CLUSTER BY`` and ``OPTIONS``
 (all of which dbt-bigquery emits), plus leading comments and backticked
-or hyphenated names for free. The snapshot and ``CALL BQ.REFRESH`` heads
-come back as an opaque :class:`exp.Command`, and the emulator's own
-``REFRESH MATERIALIZED VIEW`` extension (ADR 0017) is not BigQuery
-syntax at all, so SQLGlot rejects it; those heads are still matched by
-regex on the statement text.
+or hyphenated names for free. The snapshot heads, a clone with
+``OPTIONS`` or ``FOR SYSTEM_TIME``, and ``CALL BQ.REFRESH`` come back as
+an opaque :class:`exp.Command`, and the emulator's own ``REFRESH
+MATERIALIZED VIEW`` extension (ADR 0017) is not BigQuery syntax at all;
+those go through the :mod:`bqemulator.sql.ddl_heads` grammar.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 import re
@@ -31,6 +32,15 @@ import sqlglot
 from sqlglot import TokenType, exp
 
 from bqemulator.domain.errors import InvalidQueryError
+from bqemulator.sql.ddl_heads import (
+    CallRefresh,
+    CreateClone,
+    CreateSnapshot,
+    DropSnapshot,
+    RefreshMaterializedView,
+    option_value,
+    parse_ddl_head,
+)
 from bqemulator.sql.statement import parse_single_statement
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -48,32 +58,6 @@ class VersioningDDLKind(StrEnum):
     REFRESH_MATERIALIZED_VIEW = "REFRESH_MATERIALIZED_VIEW"
 
 
-# Heads SQLGlot returns as ``exp.Command``. Compiled with
-# ``re.IGNORECASE | re.DOTALL`` so they work against arbitrarily-cased
-# multi-line DDL bodies.
-_ID = r"`?([A-Za-z0-9_\-]+)`?"
-_QUALIFIED_NAME = rf"(?:{_ID}\s*\.\s*)?(?:{_ID}\s*\.\s*)?{_ID}"
-
-_CREATE_SNAPSHOT_RE = re.compile(
-    rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?SNAPSHOT\s+TABLE\s+(?P<dest>{_QUALIFIED_NAME})"
-    rf"\s+(?:CLONE|COPY)\s+(?P<src>{_QUALIFIED_NAME})"
-    r"\s*;?\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_DROP_SNAPSHOT_RE = re.compile(
-    rf"^\s*DROP\s+SNAPSHOT\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<dest>{_QUALIFIED_NAME})\s*;?\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_CALL_REFRESH_RE = re.compile(
-    r"^\s*CALL\s+BQ\.REFRESH_MATERIALIZED_VIEW\s*\(\s*['\"](?P<dest>[^'\"]+)['\"]\s*\)\s*;?\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-# Emulator extension; SQLGlot raises ParseError on it, so it is the one
-# head matched when the statement has no tree at all.
-_REFRESH_MATERIALIZED_VIEW_RE = re.compile(
-    rf"^\s*REFRESH\s+MATERIALIZED\s+VIEW\s+(?P<dest>{_QUALIFIED_NAME})\s*;?\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
 _MATERIALIZED_VIEW_RE = re.compile(r"MATERIALIZED\s+VIEW", flags=re.IGNORECASE)
 
 
@@ -92,12 +76,14 @@ class VersioningDDL:
     # CREATE forms.
     replace: bool = False
     if_not_exists: bool = False
+    options: dict[str, object] = field(default_factory=dict)  # lower-cased OPTIONS(...)
     # DROP forms.
     if_exists: bool = False
+    # Snapshot / clone: the ``FOR SYSTEM_TIME AS OF`` expression, as BigQuery SQL.
+    system_time: str | None = None
     # CREATE MATERIALIZED VIEW only.
     partition_by: str | None = None  # BigQuery SQL of the PARTITION BY expression
     cluster_by: tuple[str, ...] = ()
-    options: dict[str, object] = field(default_factory=dict)  # lower-cased OPTIONS(...)
 
 
 def is_versioning_ddl(sql: str) -> bool:
@@ -122,21 +108,19 @@ class VersioningDDLRouter:
 
         ``tree`` is the statement's SQLGlot parse when the caller already
         has it (the executor and interpreter parse each statement once);
-        otherwise ``sql`` is parsed here. A statement SQLGlot rejects can
-        only be the ``REFRESH MATERIALIZED VIEW`` extension. Anything
-        else that is not a single versioning statement returns ``None``
-        so the normal translator path reports it.
+        otherwise ``sql`` is parsed here. A statement SQLGlot cannot type
+        (an ``exp.Command``) or cannot parse at all goes to the DDL-head
+        grammar. Anything that is not a single versioning statement
+        returns ``None`` so the normal translator path reports it.
         """
         if tree is None:
             tree = parse_single_statement(sql)
-        if tree is None:
-            return self._parse_refresh_extension(sql)
+        if tree is None or isinstance(tree, exp.Command):
+            return self._parse_untyped(sql)
         if isinstance(tree, exp.Create):
             return self._parse_create(sql, tree)
         if isinstance(tree, exp.Drop):
             return self._parse_drop(tree)
-        if isinstance(tree, exp.Command):
-            return self._parse_command(sql)
         return None
 
     def _parse_create(self, sql: str, tree: exp.Create) -> VersioningDDL | None:
@@ -177,56 +161,48 @@ class VersioningDDLRouter:
             if_exists=bool(tree.args.get("exists")),
         )
 
-    def _parse_command(self, sql: str) -> VersioningDDL | None:
-        """Match the heads SQLGlot cannot type: snapshots and ``CALL BQ.REFRESH``."""
-        sql = sql.strip().rstrip(";").strip()
-
-        m = _CREATE_SNAPSHOT_RE.match(sql)
-        if m is not None:
-            dest_p, dest_d, dest_t = self._split_qualified(m.group("dest"))
-            src_p, src_d, src_t = self._split_qualified(m.group("src"))
+    def _parse_untyped(self, sql: str) -> VersioningDDL | None:
+        """Route the heads SQLGlot cannot type through the DDL-head grammar."""
+        head = parse_ddl_head(sql)
+        if isinstance(head, CreateSnapshot | CreateClone):
+            dest_p, dest_d, dest_t = self._split_qualified(head.target)
+            src_p, src_d, src_t = self._split_qualified(head.source)
+            kind = (
+                VersioningDDLKind.CREATE_SNAPSHOT
+                if isinstance(head, CreateSnapshot)
+                else VersioningDDLKind.CREATE_CLONE
+            )
             return VersioningDDL(
-                kind=VersioningDDLKind.CREATE_SNAPSHOT,
+                kind=kind,
                 target_project=dest_p,
                 target_dataset=dest_d,
                 target_table=dest_t,
                 source_project=src_p,
                 source_dataset=src_d,
                 source_table=src_t,
+                replace=head.replace,
+                if_not_exists=head.if_not_exists,
+                options={name: option_value(raw) for name, raw in head.options.items()},
+                system_time=head.system_time,
             )
-
-        m = _DROP_SNAPSHOT_RE.match(sql)
-        if m is not None:
-            dest_p, dest_d, dest_t = self._split_qualified(m.group("dest"))
+        if isinstance(head, DropSnapshot):
+            dest_p, dest_d, dest_t = self._split_qualified(head.target)
             return VersioningDDL(
                 kind=VersioningDDLKind.DROP_SNAPSHOT,
                 target_project=dest_p,
                 target_dataset=dest_d,
                 target_table=dest_t,
+                if_exists=head.if_exists,
             )
-
-        m = _CALL_REFRESH_RE.match(sql)
-        if m is not None:
-            return self._refresh(m.group("dest"))
-
+        if isinstance(head, CallRefresh | RefreshMaterializedView):
+            dest_p, dest_d, dest_t = self._split_qualified(head.target)
+            return VersioningDDL(
+                kind=VersioningDDLKind.REFRESH_MATERIALIZED_VIEW,
+                target_project=dest_p,
+                target_dataset=dest_d,
+                target_table=dest_t,
+            )
         return None
-
-    def _parse_refresh_extension(self, sql: str) -> VersioningDDL | None:
-        """Match the emulator-only ``REFRESH MATERIALIZED VIEW <name>`` form."""
-        m = _REFRESH_MATERIALIZED_VIEW_RE.match(sql.strip().rstrip(";").strip())
-        if m is None:
-            return None
-        return self._refresh(m.group("dest"))
-
-    def _refresh(self, raw_name: str) -> VersioningDDL:
-        """``REFRESH_MATERIALIZED_VIEW`` DDL for a textual view name."""
-        dest_p, dest_d, dest_t = self._split_qualified(raw_name)
-        return VersioningDDL(
-            kind=VersioningDDLKind.REFRESH_MATERIALIZED_VIEW,
-            target_project=dest_p,
-            target_dataset=dest_d,
-            target_table=dest_t,
-        )
 
     def _parse_create_materialized_view(self, sql: str, tree: exp.Create) -> VersioningDDL | None:
         """Parse ``CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] …``.
@@ -285,7 +261,6 @@ class VersioningDDLRouter:
 
     def _split_qualified(self, raw: str) -> tuple[str, str, str]:
         """Split ``[project.]dataset.table`` into its three parts."""
-        # Drop backticks the regex may have retained.
         cleaned = raw.replace("`", "")
         parts = [p.strip() for p in cleaned.split(".") if p.strip()]
         if len(parts) == _PARTS_FULLY_QUALIFIED:
@@ -304,6 +279,34 @@ class VersioningDDLRouter:
 _PARTS_FULLY_QUALIFIED = 3
 _PARTS_DATASET_QUALIFIED = 2
 _PARTS_BARE = 1
+
+_LABEL_PAIR_RE = re.compile(r"\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)")
+
+
+@dataclass(slots=True, frozen=True)
+class TableOptions:
+    """The ``TableMeta`` fields a snapshot / clone ``OPTIONS(...)`` clause sets."""
+
+    description: str | None = None
+    friendly_name: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
+
+
+def table_metadata_options(options: Mapping[str, object]) -> TableOptions:
+    """Metadata from a snapshot / clone ``OPTIONS(...)`` clause.
+
+    ``description`` and ``friendly_name`` carry over as strings and
+    ``labels`` from its ``[('k', 'v'), …]`` literal; the other options
+    (expiration, KMS key) have no emulator counterpart and are ignored.
+    """
+    description = options.get("description")
+    friendly_name = options.get("friendly_name")
+    labels = options.get("labels")
+    return TableOptions(
+        description=description if isinstance(description, str) else None,
+        friendly_name=friendly_name if isinstance(friendly_name, str) else None,
+        labels=dict(_LABEL_PAIR_RE.findall(labels)) if isinstance(labels, str) else {},
+    )
 
 
 def _unwrap_source(ddl: VersioningDDL) -> tuple[str, str, str]:
@@ -345,12 +348,17 @@ async def execute_versioning_ddl(
             src_project,
             src_dataset,
             src_table,
+            replace=ddl.replace,
+            if_not_exists=ddl.if_not_exists,
+            system_time=ddl.system_time,
+            options=ddl.options,
         )
     elif ddl.kind is VersioningDDLKind.DROP_SNAPSHOT:
         await SnapshotTableManager(ctx).drop(
             ddl.target_project,
             ddl.target_dataset,
             ddl.target_table,
+            if_exists=ddl.if_exists,
         )
     elif ddl.kind is VersioningDDLKind.CREATE_CLONE:
         src_project, src_dataset, src_table = _unwrap_source(ddl)
@@ -363,6 +371,8 @@ async def execute_versioning_ddl(
             src_table,
             replace=ddl.replace,
             if_not_exists=ddl.if_not_exists,
+            system_time=ddl.system_time,
+            options=ddl.options,
         )
     elif ddl.kind is VersioningDDLKind.CREATE_MATERIALIZED_VIEW:
         assert ddl.view_query is not None  # noqa: S101
@@ -437,9 +447,11 @@ def _option_value(value: exp.Expr | None) -> object:
 
 
 __all__ = [
+    "TableOptions",
     "VersioningDDL",
     "VersioningDDLKind",
     "VersioningDDLRouter",
     "execute_versioning_ddl",
     "is_versioning_ddl",
+    "table_metadata_options",
 ]

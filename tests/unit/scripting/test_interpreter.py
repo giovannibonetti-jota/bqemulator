@@ -23,7 +23,6 @@ from bqemulator.domain.events import EventBus
 from bqemulator.observability.metrics import MetricsRegistry
 from bqemulator.row_access.policy import RowAccessPolicyManager
 from bqemulator.scripting.interpreter import (
-    _classify_txn_statement,
     _dml_targets,
     run_script,
 )
@@ -641,58 +640,6 @@ SELECT n FROM `p.ds.m`;
         result = await run_script(ctx, "p", script)
         assert result.final_table is not None
         assert result.final_table.column(0).to_pylist() == [1]
-
-
-class TestClassifyTxnStatement:
-    """``_classify_txn_statement`` recognises BQ transaction-control SQL."""
-
-    @pytest.mark.parametrize(
-        "sql",
-        [
-            "BEGIN",
-            "BEGIN;",
-            "BEGIN TRANSACTION",
-            "BEGIN TRANSACTION;",
-            "  begin   transaction  ;",
-            "START TRANSACTION",
-            "Start Transaction;",
-        ],
-    )
-    def test_begin_forms(self, sql: str) -> None:
-        assert _classify_txn_statement(sql) == "BEGIN"
-
-    @pytest.mark.parametrize(
-        "sql",
-        [
-            "COMMIT",
-            "COMMIT TRANSACTION",
-            "COMMIT WORK",
-            "commit;",
-            "END TRANSACTION",
-        ],
-    )
-    def test_commit_forms(self, sql: str) -> None:
-        assert _classify_txn_statement(sql) == "COMMIT"
-
-    @pytest.mark.parametrize(
-        "sql",
-        ["ROLLBACK", "ROLLBACK TRANSACTION", "ROLLBACK WORK", "  rollback  ;"],
-    )
-    def test_rollback_forms(self, sql: str) -> None:
-        assert _classify_txn_statement(sql) == "ROLLBACK"
-
-    @pytest.mark.parametrize(
-        "sql",
-        [
-            "SELECT 1",
-            "INSERT INTO t VALUES (1)",
-            "BEGIN SELECT 1; END",  # BEGIN/END block, not a transaction
-            "ROLLBACK TO SAVEPOINT sp",  # not supported, not a plain ROLLBACK
-            "BEGINNING",  # word that starts with BEGIN
-        ],
-    )
-    def test_other_sql_is_not_txn_control(self, sql: str) -> None:
-        assert _classify_txn_statement(sql) is None
 
 
 class TestDmlTargets:

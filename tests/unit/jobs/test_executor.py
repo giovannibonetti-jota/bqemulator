@@ -149,90 +149,45 @@ class TestIsMissingExtensionError:
         assert _is_missing_extension_error(exc, "read_avro") is False
 
 
-class TestRowAccessPolicyDdlDetection:
-    """``CREATE / DROP ROW ACCESS POLICY`` regex detector + dispatch."""
-
-    def test_create_rap_regex_matches(self) -> None:
-        from bqemulator.jobs.executor import _RAP_CREATE_RE
-
-        sql = (
-            "CREATE ROW ACCESS POLICY eu_only ON `proj.ds.tbl` "
-            "GRANT TO ('user:eu@example.com') "
-            "FILTER USING (region = 'EU')"
-        )
-        match = _RAP_CREATE_RE.match(sql)
-        assert match is not None
-        assert match.group("policy") == "eu_only"
-        assert match.group("filter") == "region = 'EU'"
-
-    def test_drop_rap_regex_matches(self) -> None:
-        from bqemulator.jobs.executor import _RAP_DROP_RE
-
-        match = _RAP_DROP_RE.match("DROP ROW ACCESS POLICY p1 ON `ds.t`")
-        assert match is not None
-        assert match.group("policy") == "p1"
-
-    def test_drop_rap_if_exists_matches(self) -> None:
-        from bqemulator.jobs.executor import _RAP_DROP_RE
-
-        match = _RAP_DROP_RE.match(
-            "DROP ROW ACCESS POLICY IF EXISTS p1 ON `ds.t`",
-        )
-        assert match is not None
-        assert match.group("policy") == "p1"
-
-    def test_create_rap_if_not_exists_matches(self) -> None:
-        from bqemulator.jobs.executor import _RAP_CREATE_RE
-
-        match = _RAP_CREATE_RE.match(
-            "CREATE ROW ACCESS POLICY IF NOT EXISTS eu ON proj.ds.tbl "
-            "GRANT TO ('user:eu@example.com') FILTER USING (region = 'EU')",
-        )
-        assert match is not None
-        assert match.group("policy") == "eu"
-
-    def test_create_rap_filter_only_matches_with_null_grantees(self) -> None:
-        """No ``GRANT TO`` clause → the ``grantees`` group is ``None``."""
-        from bqemulator.jobs.executor import _RAP_CREATE_RE
-
-        match = _RAP_CREATE_RE.match(
-            "CREATE ROW ACCESS POLICY eu ON proj.ds.tbl FILTER USING (region = 'EU')",
-        )
-        assert match is not None
-        assert match.group("policy") == "eu"
-        assert match.group("grantees") is None
-        assert match.group("filter") == "region = 'EU'"
-
-    def test_create_rap_per_component_backticks_match(self) -> None:
-        from bqemulator.jobs.executor import _RAP_CREATE_RE
-
-        match = _RAP_CREATE_RE.match(
-            "CREATE ROW ACCESS POLICY `eu` ON `proj`.`ds`.`tbl` "
-            "GRANT TO ('user:eu@example.com') FILTER USING (region = 'EU')",
-        )
-        assert match is not None
-        assert match.group("policy") == "eu"
-        assert match.group("table") == "`proj`.`ds`.`tbl`"
-
-    def test_create_rap_hyphenated_project_matches(self) -> None:
-        from bqemulator.jobs.executor import _RAP_CREATE_RE
-
-        match = _RAP_CREATE_RE.match(
-            "CREATE ROW ACCESS POLICY eu ON `my-proj.ds.tbl` "
-            "GRANT TO ('user:eu@example.com') FILTER USING (region = 'EU')",
-        )
-        assert match is not None
-        assert match.group("table") == "`my-proj.ds.tbl`"
-
-    def test_unrelated_ddl_does_not_match(self) -> None:
-        from bqemulator.jobs.executor import _RAP_CREATE_RE, _RAP_DROP_RE
-
-        assert _RAP_CREATE_RE.match("CREATE TABLE t (id INT64)") is None
-        assert _RAP_DROP_RE.match("DROP TABLE t") is None
-
-
 class TestClassifyRowAccessPolicy:
-    """``classify_statement_type`` recognises RAP DDL via the regexes."""
+    """``classify_statement_type`` recognises RAP DDL via the DDL-head grammar."""
+
+    def test_comment_prefixed_create_rap_classifies(self) -> None:
+        """dbt-style leading comments do not hide the head."""
+        from bqemulator.jobs.executor import classify_statement_type
+
+        assert (
+            classify_statement_type(
+                '/* {"app": "dbt"} */\nCREATE ROW ACCESS POLICY eu ON proj.ds.tbl '
+                "FILTER USING (region = 'EU')",
+            )
+            == "CREATE_ROW_ACCESS_POLICY"
+        )
+
+    def test_drop_all_rap_classifies_as_drop(self) -> None:
+        from bqemulator.jobs.executor import classify_statement_type
+
+        assert (
+            classify_statement_type("DROP ALL ROW ACCESS POLICIES ON proj.ds.tbl")
+            == "DROP_ROW_ACCESS_POLICY"
+        )
+
+    def test_snapshot_ddl_classifies(self) -> None:
+        """Snapshot DDL is a ``Command`` for sqlglot; the grammar supplies the type."""
+        from bqemulator.jobs.executor import classify_statement_type
+
+        assert classify_statement_type("CREATE SNAPSHOT TABLE ds.s CLONE ds.t") == (
+            "CREATE_SNAPSHOT_TABLE"
+        )
+        assert classify_statement_type("DROP SNAPSHOT TABLE IF EXISTS ds.s") == (
+            "DROP_SNAPSHOT_TABLE"
+        )
+
+    def test_malformed_head_classifies_as_unknown(self) -> None:
+        """Classification stays best-effort; the executing fast path reports the error."""
+        from bqemulator.jobs.executor import classify_statement_type
+
+        assert classify_statement_type("CREATE SNAPSHOT TABLE ds.s FROM ds.t") == ""
 
     def test_create_rap_classifies(self) -> None:
         from bqemulator.jobs.executor import classify_statement_type
