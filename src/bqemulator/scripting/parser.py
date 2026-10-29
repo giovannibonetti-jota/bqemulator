@@ -549,14 +549,23 @@ class Parser:
             return False
         self._cursor.advance()
         # NOT and EXISTS lex as identifiers, not keywords.
-        for word in ("NOT", "EXISTS"):
-            tok = self._cursor.current
-            if tok.kind not in ("KEYWORD", "IDENT") or tok.value.upper() != word:
-                raise InvalidQueryError(f"Expected {word!r} after IF, got {tok.kind}:{tok.value!r}")
-            self._cursor.advance()
+        self._expect_word("NOT")
+        self._expect_word("EXISTS")
         if or_replace:
             raise InvalidQueryError("OR REPLACE and IF NOT EXISTS cannot both be specified")
         return True
+
+    def _is_word(self, word: str) -> bool:
+        """True when the current token is ``word``, as a keyword or an identifier."""
+        tok = self._cursor.current
+        return tok.kind in ("KEYWORD", "IDENT") and tok.value.upper() == word
+
+    def _expect_word(self, word: str) -> None:
+        """Consume ``word`` whether the lexer classed it as a keyword or an identifier."""
+        if not self._is_word(word):
+            tok = self._cursor.current
+            raise InvalidQueryError(f"Expected {word!r}, got {tok.kind}:{tok.value!r}")
+        self._cursor.advance()
 
     def _parse_function_rest(
         self, *, or_replace: bool, table_fn: bool, if_not_exists: bool = False
@@ -567,6 +576,14 @@ class Parser:
         if self._cursor.match_keyword("RETURNS"):
             self._cursor.advance()
             return_type = parse_bq_type_string(self._read_type_name())
+
+        # ``[NOT] DETERMINISTIC`` (BigQuery's volatility hint, emitted by
+        # dbt for JavaScript UDFs) is accepted and ignored.
+        if self._is_word("NOT"):
+            self._cursor.advance()
+            self._expect_word("DETERMINISTIC")
+        elif self._is_word("DETERMINISTIC"):
+            self._cursor.advance()
 
         language = "SQL"
         body = ""
