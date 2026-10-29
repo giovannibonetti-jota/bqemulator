@@ -9,17 +9,24 @@ executor asks this module whether the incoming statement is a
 versioning DDL, and if so delegates the whole job to the matching
 manager.
 
-The detection is regex-based (similar in spirit to
-``sql/rewriter/information_schema.py``) rather than AST-based so we
-can intercept before the translator rejects the statement.
+The snapshot / clone / drop / refresh forms are detected by regex
+(similar in spirit to ``sql/rewriter/information_schema.py``) so we can
+intercept before the translator rejects the statement. ``CREATE
+MATERIALIZED VIEW`` is parsed with SQLGlot instead: its grammar carries
+``IF NOT EXISTS``, ``PARTITION BY``, ``CLUSTER BY`` and ``OPTIONS(...)``
+(all of which dbt-bigquery emits), and the body must reach the
+materialized-view manager verbatim for BigQuery's query rules.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import re
 from typing import TYPE_CHECKING
+
+import sqlglot
+from sqlglot import TokenType, exp
 
 from bqemulator.domain.errors import InvalidQueryError
 
@@ -59,11 +66,7 @@ _CREATE_CLONE_RE = re.compile(
     r"\s*;?\s*$",
     flags=re.IGNORECASE | re.DOTALL,
 )
-_CREATE_MATERIALIZED_VIEW_RE = re.compile(
-    rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW\s+(?P<dest>{_QUALIFIED_NAME})"
-    r"\s+AS\s+(?P<query>.+?)\s*;?\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
+_MATERIALIZED_VIEW_RE = re.compile(r"MATERIALIZED\s+VIEW", flags=re.IGNORECASE)
 _DROP_MATERIALIZED_VIEW_RE = re.compile(
     rf"^\s*DROP\s+MATERIALIZED\s+VIEW\s+(?:IF\s+EXISTS\s+)?(?P<dest>{_QUALIFIED_NAME})\s*;?\s*$",
     flags=re.IGNORECASE | re.DOTALL,
@@ -87,6 +90,12 @@ class VersioningDDL:
     source_dataset: str | None = None
     source_table: str | None = None
     view_query: str | None = None
+    # CREATE MATERIALIZED VIEW only.
+    replace: bool = False
+    if_not_exists: bool = False
+    partition_by: str | None = None  # BigQuery SQL of the PARTITION BY expression
+    cluster_by: tuple[str, ...] = ()
+    options: dict[str, object] = field(default_factory=dict)  # lower-cased OPTIONS(...)
 
 
 def is_versioning_ddl(sql: str) -> bool:
@@ -95,8 +104,8 @@ def is_versioning_ddl(sql: str) -> bool:
     return (
         "SNAPSHOT" in upper
         or "CLONE" in upper
-        or "MATERIALIZED VIEW" in upper
         or "REFRESH_MATERIALIZED_VIEW" in upper
+        or _MATERIALIZED_VIEW_RE.search(sql) is not None
     )
 
 
@@ -148,16 +157,9 @@ class VersioningDDLRouter:
                 source_table=src_t,
             )
 
-        m = _CREATE_MATERIALIZED_VIEW_RE.match(sql)
-        if m is not None:
-            dest_p, dest_d, dest_t = self._split_qualified(m.group("dest"))
-            return VersioningDDL(
-                kind=VersioningDDLKind.CREATE_MATERIALIZED_VIEW,
-                target_project=dest_p,
-                target_dataset=dest_d,
-                target_table=dest_t,
-                view_query=m.group("query").strip(),
-            )
+        create_mv = self._parse_create_materialized_view(sql)
+        if create_mv is not None:
+            return create_mv
 
         m = _DROP_MATERIALIZED_VIEW_RE.match(sql)
         if m is not None:
@@ -181,6 +183,59 @@ class VersioningDDLRouter:
             )
 
         return None
+
+    def _parse_create_materialized_view(self, sql: str) -> VersioningDDL | None:
+        """Parse ``CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] …``.
+
+        The head (target, ``PARTITION BY``, ``CLUSTER BY``, ``OPTIONS``)
+        comes from SQLGlot's :class:`exp.Create`; the body is sliced from
+        the original text after the first top-level ``AS`` so the manager
+        stores and validates exactly what the caller wrote. Returns
+        ``None`` for anything that is not a materialized-view CREATE,
+        including SQL SQLGlot cannot parse (the translator reports that).
+        """
+        if _MATERIALIZED_VIEW_RE.search(sql) is None:
+            return None
+        try:
+            tree = sqlglot.parse_one(sql, read="bigquery")
+        except Exception:  # noqa: BLE001 — not ours to diagnose
+            return None
+        if not isinstance(tree, exp.Create) or (tree.kind or "").upper() != "VIEW":
+            return None
+        properties = tree.args.get("properties")
+        props = list(properties.expressions) if isinstance(properties, exp.Properties) else []
+        if not any(isinstance(p, exp.MaterializedProperty) for p in props):
+            return None
+        target = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+        if not isinstance(target, exp.Table):
+            return None
+        body = _body_after_top_level_as(sql)
+        if body is None:
+            raise InvalidQueryError("CREATE MATERIALIZED VIEW requires an AS <query> body")
+        partition_by: str | None = None
+        cluster_by: tuple[str, ...] = ()
+        options: dict[str, object] = {}
+        for prop in props:
+            if isinstance(prop, exp.PartitionedByProperty):
+                partition_by = prop.this.sql("bigquery")
+            elif isinstance(prop, exp.ClusterProperty):
+                cluster_by = tuple(e.name or e.sql("bigquery") for e in prop.expressions)
+            elif type(prop) is exp.Property:
+                options[prop.name.lower()] = _option_value(prop.args.get("value"))
+        qualified = ".".join(part for part in (target.catalog, target.db, target.name) if part)
+        dest_p, dest_d, dest_t = self._split_qualified(qualified)
+        return VersioningDDL(
+            kind=VersioningDDLKind.CREATE_MATERIALIZED_VIEW,
+            target_project=dest_p,
+            target_dataset=dest_d,
+            target_table=dest_t,
+            view_query=body,
+            replace=bool(tree.args.get("replace")),
+            if_not_exists=bool(tree.args.get("exists")),
+            partition_by=partition_by,
+            cluster_by=cluster_by,
+            options=options,
+        )
 
     def _split_qualified(self, raw: str) -> tuple[str, str, str]:
         """Split ``[project.]dataset.table`` into its three parts."""
@@ -268,6 +323,11 @@ async def execute_versioning_ddl(
             ddl.target_dataset,
             ddl.target_table,
             ddl.view_query,
+            replace=ddl.replace,
+            if_not_exists=ddl.if_not_exists,
+            partition_by=ddl.partition_by,
+            cluster_by=ddl.cluster_by,
+            options=ddl.options,
         )
     elif ddl.kind is VersioningDDLKind.DROP_MATERIALIZED_VIEW:
         await MaterializedViewManager(ctx).drop(
@@ -283,6 +343,48 @@ async def execute_versioning_ddl(
         )
     else:  # pragma: no cover — all branches enumerated
         raise InvalidQueryError(f"Unknown Phase-7 DDL: {ddl.kind}")
+
+
+def _body_after_top_level_as(sql: str) -> str | None:
+    """Return the text after the first ``AS`` outside parentheses, or ``None``.
+
+    ``PARTITION BY DATE(CAST(ts AS TIMESTAMP))`` and ``OPTIONS(description=
+    'as is')`` both contain ``AS`` tokens, so the tokenizer tracks depth
+    and string literals rather than searching the raw text.
+    """
+    tokens = sqlglot.Dialect.get_or_raise("bigquery").tokenizer_class().tokenize(sql)
+    depth = 0
+    for token in tokens:
+        if token.token_type is TokenType.L_PAREN:
+            depth += 1
+        elif token.token_type is TokenType.R_PAREN:
+            depth -= 1
+        elif token.token_type is TokenType.ALIAS and depth == 0:
+            body = sql[token.end + 1 :].strip()
+            return body or None
+    return None
+
+
+def _option_value(value: exp.Expr | None) -> object:
+    """Python value of an ``OPTIONS(name=value)`` entry.
+
+    Booleans and integer / string literals become their Python
+    counterparts; anything else (``INTERVAL``, arrays, struct literals)
+    stays as BigQuery SQL text.
+    """
+    if value is None:
+        return None
+    if isinstance(value, exp.Boolean):
+        return value.this
+    if isinstance(value, exp.Literal):
+        if value.is_string:
+            return value.this
+        if value.is_int:
+            return int(value.this)
+        return float(value.this)
+    if isinstance(value, exp.Null):
+        return None
+    return value.sql("bigquery")
 
 
 __all__ = [

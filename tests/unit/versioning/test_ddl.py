@@ -116,3 +116,66 @@ def test_parse_rejects_bare_table_reference() -> None:
     router = VersioningDDLRouter("p")
     with pytest.raises(InvalidQueryError):
         router.parse("CREATE TABLE single CLONE other_single")
+
+
+def test_parse_create_materialized_view_dbt_shape() -> None:
+    """The ``IF NOT EXISTS`` / ``PARTITION BY`` / ``CLUSTER BY`` / ``OPTIONS`` shape dbt emits."""
+    router = VersioningDDLRouter("p")
+    parsed = router.parse(
+        """
+        create materialized view if not exists `q`.`ds`.`mv`
+        partition by DATE(CAST(ts AS TIMESTAMP))
+        cluster by created_at, country
+        OPTIONS(
+          enable_refresh=True,
+          refresh_interval_minutes=30,
+          description='as is',
+          max_staleness=INTERVAL "0:30:0" HOUR TO SECOND,
+          allow_non_incremental_definition=true
+        )
+        as (SELECT *, TIMESTAMP_MICROS(id >> 11) AS created_at FROM `q`.`ds`.`orders`);
+        """,
+    )
+    assert parsed is not None
+    assert parsed.kind is VersioningDDLKind.CREATE_MATERIALIZED_VIEW
+    assert (parsed.target_project, parsed.target_dataset, parsed.target_table) == ("q", "ds", "mv")
+    assert parsed.if_not_exists is True
+    assert parsed.replace is False
+    assert parsed.partition_by == "DATE(CAST(ts AS TIMESTAMP))"
+    assert parsed.cluster_by == ("created_at", "country")
+    assert parsed.options == {
+        "enable_refresh": True,
+        "refresh_interval_minutes": 30,
+        "description": "as is",
+        "max_staleness": "INTERVAL '0:30:0' HOUR TO SECOND",
+        "allow_non_incremental_definition": True,
+    }
+    # The body is the caller's text, not a SQLGlot re-rendering.
+    assert parsed.view_query == (
+        "(SELECT *, TIMESTAMP_MICROS(id >> 11) AS created_at FROM `q`.`ds`.`orders`)"
+    )
+
+
+def test_parse_create_or_replace_materialized_view() -> None:
+    router = VersioningDDLRouter("p")
+    parsed = router.parse(
+        "CREATE OR REPLACE MATERIALIZED VIEW `my-proj.ds.mv` AS SELECT a FROM ds.t",
+    )
+    assert parsed is not None
+    assert parsed.replace is True
+    assert parsed.if_not_exists is False
+    assert parsed.target_project == "my-proj"
+    assert parsed.view_query == "SELECT a FROM ds.t"
+    assert parsed.options == {}
+
+
+def test_parse_create_materialized_view_without_body() -> None:
+    router = VersioningDDLRouter("p")
+    with pytest.raises(InvalidQueryError, match="AS <query>"):
+        router.parse("CREATE MATERIALIZED VIEW ds.mv OPTIONS(enable_refresh=true)")
+
+
+def test_parse_leaves_plain_views_and_tables_alone() -> None:
+    router = VersioningDDLRouter("p")
+    assert router.parse("CREATE VIEW ds.v AS SELECT 1") is None
+    assert router.parse("CREATE TABLE ds.t AS SELECT 1") is None
