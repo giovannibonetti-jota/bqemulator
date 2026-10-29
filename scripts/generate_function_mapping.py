@@ -108,6 +108,7 @@ _REWRITER_CATEGORY_DISPLAY: dict[str, str] = {
     "specialized_types": "Pre-translator (RANGE/INTERVAL literals)",
     "string_helpers": "Pre-translator (string helpers)",
     "struct_helpers": "Pre-translator (STRUCT helpers)",
+    "struct_star": "Post-translator (STRUCT dot-star)",
     "timestamp_iso_helpers": "Pre-translator (TIMESTAMP ISO helpers)",
     "unnest_offset": "Pre-translator (UNNEST WITH OFFSET)",
     "unnest_struct": "Pre-translator (UNNEST STRUCT aliases)",

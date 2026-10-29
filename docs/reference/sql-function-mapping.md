@@ -51,7 +51,7 @@ table below maps each BigQuery view to its rewriter function.
 > **Auto-generated.** Edit translation rules under [`src/bqemulator/sql/rules/`](https://github.com/jjviscomi/bqemulator/blob/main/src/bqemulator/sql/rules/) or rewriters under [`src/bqemulator/sql/rewriter/`](https://github.com/jjviscomi/bqemulator/blob/main/src/bqemulator/sql/rewriter/), then run `make function-mapping` to regenerate this block. The CI gate (`--check`) refuses to merge a PR whose committed registry has drifted from the live source. Per-rule docstring summaries are extracted as the cell text — if a cell reads wrong, edit the rule's docstring.
 
 - **Registered rules**: 92 (13 rule modules)
-- **Rewriter functions**: 24 (24 rewriter modules; the INFORMATION_SCHEMA rewriter has its own hand-maintained per-view table below)
+- **Rewriter functions**: 25 (25 rewriter modules; the INFORMATION_SCHEMA rewriter has its own hand-maintained per-view table below)
 
 ### Translation rules (post-transpile AST passes)
 
@@ -172,6 +172,7 @@ table below maps each BigQuery view to its rewriter function.
 | Pre-translator (RANGE/INTERVAL literals) | Pre-translate BigQuery SQL for specialized-type literal forms | — | `rewrite_specialized_types` |
 | Pre-translator (string helpers) | Pre-translate BigQuery NORMALIZE / NORMALIZE_AND_CASEFOLD / 4-arg INSTR | — | `rewrite_string_helpers` |
 | Pre-translator (STRUCT helpers) | Pre-translate BigQuery SQL for positional `STRUCT` literals | — | `rewrite_struct_helpers` |
+| Post-translator (STRUCT dot-star) | `<struct expr>.*` select item | `expr.f1 AS f1, expr.f2 AS f2, …` | `expand_struct_star` |
 | Pre-translator (TIMESTAMP ISO helpers) | Pre-translate `FORMAT_TIMESTAMP` / `PARSE_TIMESTAMP` to the helper UDFs | — | `rewrite_timestamp_iso_helpers` |
 | Pre-translator (UNNEST WITH OFFSET) | Rebase `WITH OFFSET` columns to 0-based semantics | — | `rewrite_unnest_offset` |
 | Pre-translator (UNNEST STRUCT aliases) | Propagate named-struct field aliases inside `UNNEST([...])` arrays | — | `rewrite_unnest_struct` |

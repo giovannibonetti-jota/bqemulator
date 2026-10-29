@@ -49,6 +49,7 @@ from bqemulator.sql.rewriter.sha512 import rewrite_sha512
 from bqemulator.sql.rewriter.specialized_types import rewrite_specialized_types
 from bqemulator.sql.rewriter.string_helpers import rewrite_string_helpers
 from bqemulator.sql.rewriter.struct_helpers import rewrite_struct_helpers
+from bqemulator.sql.rewriter.struct_star import expand_struct_star
 from bqemulator.sql.rewriter.timestamp_iso_helpers import (
     rewrite_timestamp_iso_helpers,
 )
@@ -425,6 +426,13 @@ class SQLTranslator:
 
         if schema is not None:
             tree, _qualified_ok = self._annotate_tree(tree, schema)
+
+        # ``expr.*`` select items need the type annotations above to
+        # name the struct's fields, and must be expanded before the
+        # rule walk so the per-field copies of ``expr`` get rewritten
+        # like any other subtree.
+        if expand_struct_star(tree):
+            modified = True
 
         # Snapshot nodes pre-order, then iterate in reverse — children
         # of any parent appear *after* the parent in pre-order, so
